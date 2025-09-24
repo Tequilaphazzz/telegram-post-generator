@@ -6,9 +6,7 @@ from flask_cors import CORS
 import os
 import json
 import base64
-from datetime import datetime
 import asyncio
-import threading
 
 from utils.ai_generator import AIGenerator
 from utils.image_processor import ImageProcessor
@@ -16,22 +14,23 @@ from utils.telegram_publisher import TelegramPublisher
 from config import Config
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-in-production'
+# Используем секретный ключ из конфигурационного класса
+app.secret_key = Config.SECRET_KEY
 CORS(app)
 
-# Глобальные переменные для хранения временных данных
-current_post_data = {}
+# Инициализируем публикатор один раз, передавая весь объект конфигурации
+publisher = TelegramPublisher(Config)
 
 def load_config():
     """Загрузка конфигурации из файла"""
-    if os.path.exists('config.json'):
-        with open('config.json', 'r', encoding='utf-8') as f:
+    if os.path.exists(Config.CONFIG_FILE):
+        with open(Config.CONFIG_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {}
 
 def save_config(config_data):
     """Сохранение конфигурации в файл"""
-    with open('config.json', 'w', encoding='utf-8') as f:
+    with open(Config.CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config_data, f, ensure_ascii=False, indent=2)
 
 @app.route('/')
@@ -44,15 +43,9 @@ def save_configuration():
     """Сохранение API ключей"""
     try:
         data = request.json
-        config = {
-            'openai_key': data.get('openai_key', ''),
-            'stability_key': data.get('stability_key', ''),
-            'telegram_api_id': data.get('telegram_api_id', ''),
-            'telegram_api_hash': data.get('telegram_api_hash', ''),
-            'telegram_phone': data.get('telegram_phone', ''),
-            'telegram_group': data.get('telegram_group', '')
-        }
-        save_config(config)
+        # Обновляем глобальный объект Config, чтобы изменения применились сразу
+        Config.update(data)
+        save_config(data)
         return jsonify({'status': 'success', 'message': 'Конфигурация сохранена'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -61,11 +54,11 @@ def save_configuration():
 def get_configuration():
     """Получение сохраненной конфигурации"""
     try:
-        config = load_config()
-        # Скрываем часть ключей для безопасности
+        config_data = load_config()
         safe_config = {}
-        for key, value in config.items():
-            if value and len(value) > 10:
+        for key, value in config_data.items():
+            # Скрываем часть ключей и хэшей для безопасности на фронтенде
+            if ('key' in key or 'hash' in key) and value and len(value) > 10:
                 safe_config[key] = value[:5] + '*' * (len(value) - 10) + value[-5:]
             else:
                 safe_config[key] = value
@@ -76,52 +69,32 @@ def get_configuration():
 @app.route('/generate_content', methods=['POST'])
 def generate_content():
     """Генерация контента (текст, изображение, заголовок)"""
-    global current_post_data
-
     try:
         data = request.json
         topic = data.get('topic')
-
         if not topic:
             return jsonify({'status': 'error', 'message': 'Тема не указана'}), 400
 
-        config = load_config()
-
-        # Инициализация генератора AI
         ai_gen = AIGenerator(
-            openai_key=config.get('openai_key'),
-            stability_key=config.get('stability_key')
+            openai_key=Config.OPENAI_KEY,
+            stability_key=Config.STABILITY_KEY
         )
 
-        # Генерация текста поста
         post_text = ai_gen.generate_post_text(topic)
-
-        # Генерация промпта для изображения
         image_prompt = ai_gen.generate_image_prompt(post_text)
-
-        # Генерация изображения
         image_data = ai_gen.generate_image(image_prompt)
-
-        # Генерация заголовка для изображения
         headline = ai_gen.generate_headline(post_text)
 
-        # Обработка изображения
         processor = ImageProcessor()
-        processed_image = processor.process_image(
-            image_data,
-            headline,
-            aspect_ratio=(9, 16)
-        )
+        # Соотношение сторон 9:16 для Stories
+        processed_image = processor.process_image(image_data, headline, aspect_ratio=(9, 16))
 
-        # Конвертация в base64 для отправки на фронтенд
-        image_base64 = base64.b64encode(processed_image).decode('utf-8')
-
-        # Сохранение данных для последующей публикации
-        current_post_data = {
+        # Сохраняем данные в сессию Flask
+        session['current_post_data'] = {
             'text': post_text,
-            'image': processed_image,
+            'image': base64.b64encode(processed_image).decode('utf-8'),
+            'original_image': base64.b64encode(image_data).decode('utf-8'),
             'headline': headline,
-            'original_image': image_data,
             'topic': topic
         }
 
@@ -129,79 +102,53 @@ def generate_content():
             'status': 'success',
             'data': {
                 'text': post_text,
-                'image': f'data:image/png;base64,{image_base64}',
+                'image': f"data:image/png;base64,{base64.b64encode(processed_image).decode('utf-8')}",
                 'headline': headline
             }
         })
-
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/regenerate_content', methods=['POST'])
 def regenerate_content():
-    """Регенерация отдельных частей контента"""
-    global current_post_data
-
+    """Регенерация отдельных частей контента (с использованием сессии)"""
     try:
+        post_data = session.get('current_post_data')
+        if not post_data:
+            return jsonify({'status': 'error', 'message': 'Данные для регенерации не найдены. Сгенерируйте пост заново.'}), 400
+
         data = request.json
         content_type = data.get('type')
 
-        config = load_config()
-        ai_gen = AIGenerator(
-            openai_key=config.get('openai_key'),
-            stability_key=config.get('stability_key')
-        )
+        ai_gen = AIGenerator(openai_key=Config.OPENAI_KEY, stability_key=Config.STABILITY_KEY)
+        processor = ImageProcessor()
 
         if content_type == 'text':
-            # Регенерация текста
-            new_text = ai_gen.generate_post_text(current_post_data['topic'])
-            current_post_data['text'] = new_text
+            new_text = ai_gen.generate_post_text(post_data['topic'])
+            session['current_post_data']['text'] = new_text
             return jsonify({'status': 'success', 'data': {'text': new_text}})
 
         elif content_type == 'image':
-            # Регенерация изображения
-            image_prompt = ai_gen.generate_image_prompt(current_post_data['text'])
-            image_data = ai_gen.generate_image(image_prompt)
-            current_post_data['original_image'] = image_data
+            image_prompt = ai_gen.generate_image_prompt(post_data['text'])
+            new_image_data = ai_gen.generate_image(image_prompt)
+            processed_image = processor.process_image(new_image_data, post_data['headline'])
 
-            # Обработка с текущим заголовком
-            processor = ImageProcessor()
-            processed_image = processor.process_image(
-                image_data,
-                current_post_data['headline'],
-                aspect_ratio=(9, 16)
-            )
-            current_post_data['image'] = processed_image
+            session['current_post_data']['original_image'] = base64.b64encode(new_image_data).decode('utf-8')
+            session['current_post_data']['image'] = base64.b64encode(processed_image).decode('utf-8')
 
             image_base64 = base64.b64encode(processed_image).decode('utf-8')
-            return jsonify({
-                'status': 'success',
-                'data': {'image': f'data:image/png;base64,{image_base64}'}
-            })
+            return jsonify({'status': 'success', 'data': {'image': f'data:image/png;base64,{image_base64}'}})
 
         elif content_type == 'headline':
-            # Регенерация заголовка
-            new_headline = ai_gen.generate_headline(current_post_data['text'])
-            current_post_data['headline'] = new_headline
+            new_headline = ai_gen.generate_headline(post_data['text'])
+            original_image = base64.b64decode(post_data['original_image'])
+            processed_image = processor.process_image(original_image, new_headline)
 
-            # Перерисовка изображения с новым заголовком
-            processor = ImageProcessor()
-            processed_image = processor.process_image(
-                current_post_data['original_image'],
-                new_headline,
-                aspect_ratio=(9, 16)
-            )
-            current_post_data['image'] = processed_image
+            session['current_post_data']['headline'] = new_headline
+            session['current_post_data']['image'] = base64.b64encode(processed_image).decode('utf-8')
 
             image_base64 = base64.b64encode(processed_image).decode('utf-8')
-            return jsonify({
-                'status': 'success',
-                'data': {
-                    'headline': new_headline,
-                    'image': f'data:image/png;base64,{image_base64}'
-                }
-            })
-
+            return jsonify({'status': 'success', 'data': {'headline': new_headline, 'image': f'data:image/png;base64,{image_base64}'}})
         else:
             return jsonify({'status': 'error', 'message': 'Неверный тип контента'}), 400
 
@@ -211,45 +158,34 @@ def regenerate_content():
 @app.route('/publish_post', methods=['POST'])
 def publish_post():
     """Публикация поста в Telegram"""
-    global current_post_data
-
     try:
-        if not current_post_data:
+        post_data = session.get('current_post_data')
+        if not post_data:
             return jsonify({'status': 'error', 'message': 'Нет данных для публикации'}), 400
 
-        config = load_config()
+        image_bytes = base64.b64decode(post_data['image'])
 
-        # Асинхронная публикация в Telegram
-        def run_async_publish():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            publisher = TelegramPublisher(
-                api_id=config.get('telegram_api_id'),
-                api_hash=config.get('telegram_api_hash'),
-                phone=config.get('telegram_phone')
+        # Используем asyncio.run для вызова асинхронной функции
+        result = asyncio.run(
+            publisher.publish_post(
+                group_username=Config.TELEGRAM_GROUP,
+                text=post_data['text'],
+                image=image_bytes,
+                publish_to_story=True
             )
+        )
 
-            result = loop.run_until_complete(
-                publisher.publish_post(
-                    group_username=config.get('telegram_group'),
-                    text=current_post_data['text'],
-                    image=current_post_data['image'],
-                    publish_to_story=True
-                )
-            )
-            return result
+        # Если для входа нужен код, отправляем соответствующий ответ
+        if isinstance(result, dict) and result.get('status') == 'verification_required':
+             return jsonify(result)
 
-        # Запуск в отдельном потоке
-        thread = threading.Thread(target=run_async_publish)
-        thread.start()
-        thread.join(timeout=30)
+        session.pop('current_post_data', None)
 
         return jsonify({
             'status': 'success',
-            'message': 'Пост успешно опубликован в Telegram!'
+            'message': 'Пост успешно опубликован!',
+            'details': result
         })
-
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
@@ -257,36 +193,22 @@ def publish_post():
 def verify_telegram_code():
     """Верификация кода Telegram"""
     try:
-        data = request.json
-        code = data.get('code')
+        code = request.json.get('code')
+        if not code:
+            return jsonify({'status': 'error', 'message': 'Код не указан'}), 400
 
-        config = load_config()
+        result = asyncio.run(publisher.verify_code(code))
 
-        def run_async_verify():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            publisher = TelegramPublisher(
-                api_id=config.get('telegram_api_id'),
-                api_hash=config.get('telegram_api_hash'),
-                phone=config.get('telegram_phone')
-            )
-
-            result = loop.run_until_complete(
-                publisher.verify_code(code)
-            )
-            return result
-
-        thread = threading.Thread(target=run_async_verify)
-        thread.start()
-        thread.join(timeout=10)
-
-        return jsonify({'status': 'success', 'message': 'Код подтвержден'})
+        if result:
+            return jsonify({'status': 'success', 'message': 'Код подтвержден. Попробуйте опубликовать снова.'})
+        else:
+            return jsonify({'status': 'error', 'message': 'Не удалось войти. Возможно, неверный код или пароль.'}), 400
 
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
+    # Создаем директории, если они не существуют
     os.makedirs('templates', exist_ok=True)
     os.makedirs('static', exist_ok=True)
     os.makedirs('utils', exist_ok=True)
