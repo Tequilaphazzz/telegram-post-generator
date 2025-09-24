@@ -7,6 +7,7 @@ import requests
 import json
 import base64
 from typing import Optional
+import httpx
 from config import Config
 
 
@@ -21,7 +22,18 @@ class AIGenerator:
             openai_key: API ключ OpenAI
             stability_key: API ключ Stability AI
         """
+        # 2. Правильная инициализация клиента с прокси
+        # Если прокси не нужен, просто удалите http_client
+        # proxy_url = "http://user:password@proxy.example.com:8080"
+        # proxies = {"http://": proxy_url, "https://": proxy_url}
+
+        # Раскомментируйте следующие строки, если вам нужен прокси
+        # http_client = httpx.Client(proxies=proxies)
+        # self.openai_client = OpenAI(api_key=openai_key, http_client=http_client)
+
+        # Если прокси не нужен, оставьте как было:
         self.openai_client = OpenAI(api_key=openai_key)
+
         self.stability_key = stability_key
         self.stability_api_host = "https://api.stability.ai"
 
