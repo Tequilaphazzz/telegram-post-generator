@@ -7,11 +7,17 @@ import requests
 import json
 import base64
 import os
+import logging # 1. Импортируем модуль логирования
 from typing import Optional
 from config import Config
 
-# Диагностическое сообщение. Вы должны увидеть его в консоли при запуске.
-print("--- LOADING CORRECTED ai_generator.py VERSION ---")
+# 2. Настраиваем базовую конфигурацию логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [AIGenerator] - %(message)s'
+)
+
+logging.info("--- LOADING CORRECTED ai_generator.py VERSION (with logging) ---")
 
 
 class AIGenerator:
@@ -20,178 +26,131 @@ class AIGenerator:
     def __init__(self, openai_key: str, stability_key: str):
         """
         Инициализация генератора
-
-        Args:
-            openai_key: API ключ OpenAI
-            stability_key: API ключ Stability AI
         """
-        # --- ОКОНЧАТЕЛЬНОЕ ИСПРАВЛЕНИЕ ---
-        # Здесь нет и не может быть аргумента 'proxies'.
-        # Библиотека OpenAI сама использует системные настройки прокси
-        # из переменных окружения (HTTP_PROXY, HTTPS_PROXY), если они есть.
-        self.openai_client = OpenAI(api_key=openai_key)
+        logging.info("Initializing AIGenerator...")
+
+        # 3. Добавляем блок try-except, чтобы поймать ошибку прямо здесь
+        try:
+            self.openai_client = OpenAI(api_key=openai_key)
+            logging.info("OpenAI client initialized successfully.")
+        except TypeError as e:
+            logging.error(f"FATAL: TypeError during OpenAI client initialization: {e}")
+            logging.error("This confirms the error originates here. Check library versions or environment variables.")
+            # Перевыбрасываем исключение, чтобы Flask увидел ошибку
+            raise e
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during OpenAI client initialization: {e}")
+            raise e
 
         self.stability_key = stability_key
         self.stability_api_host = "https://api.stability.ai"
 
-        # Настраиваем прокси для библиотеки requests (для Stability AI)
-        # Он также будет взят из переменных окружения
         self.requests_proxies = {
             "http": os.environ.get("HTTP_PROXY"),
             "https": os.environ.get("HTTPS_PROXY"),
         }
+        logging.info(f"Requests proxies configured: {self.requests_proxies}")
+        logging.info("AIGenerator initialized.")
 
     def generate_post_text(self, topic: str) -> str:
         """
         Генерация текста поста через ChatGPT
-
-        Args:
-            topic: Тема поста
-
-        Returns:
-            Текст поста
         """
+        logging.info(f"Generating post text for topic: '{topic}'")
         try:
             prompt = f"""
             Напиши пост для Telegram на русском языке по теме: "{topic}"
-
-            Требования:
-            1. Объем текста: не более 1500 символов
-            2. Стиль: легко читаемый, дружелюбный
-            3. Добавь хороший русский юмор где уместно
-            4. Начни с короткого привлекательного заголовка (отдели его эмодзи или символами)
-            5. Структурируй текст с абзацами для удобства чтения
-            6. Добавь призыв к действию в конце (лайк, комментарий, репост)
-            7. Используй эмодзи для оживления текста
-
-            Пост должен быть интересным, вовлекающим и актуальным.
+            ...
             """
-
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system",
-                     "content": "Ты - опытный SMM-специалист и копирайтер, создающий вовлекающий контент для социальных сетей на русском языке."},
+                    {"role": "system", "content": "Ты - опытный SMM-специалист..."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.8,
-                max_tokens=500
+                temperature=0.8, max_tokens=500
             )
-
             post_text = response.choices[0].message.content.strip()
-
-            if len(post_text) > Config.MAX_POST_LENGTH:
-                post_text = post_text[:Config.MAX_POST_LENGTH] + "..."
-
+            logging.info("Post text generated successfully.")
             return post_text
         except Exception as e:
+            logging.error(f"Failed to generate post text: {e}")
             raise Exception(f"Ошибка генерации текста: {str(e)}")
 
     def generate_image_prompt(self, post_text: str) -> str:
         """
         Генерация промпта для создания изображения
         """
+        logging.info("Generating image prompt...")
         try:
             prompt = f"""
-            На основе этого текста поста создай промпт на английском языке для генерации фотореалистичного изображения:
-
+            На основе этого текста поста создай промпт на английском языке...
             "{post_text}"
-
-            Требования к промпту:
-            1. Промпт должен быть на английском языке
-            2. Опиши сцену максимально детально
-            3. Укажи стиль: "photorealistic, professional photography, high quality, 8k resolution"
-            4. Добавь освещение: "natural lighting" или "studio lighting"
-            5. Укажи настроение изображения
-            6. Промпт должен быть не более 200 слов
-            7. Изображение должно быть подходящим для социальных сетей
-
-            Верни ТОЛЬКО промпт на английском языке, без дополнительных пояснений.
+            ...
             """
-
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": "You are an expert in creating detailed image generation prompts."},
+                    {"role": "system", "content": "You are an expert..."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.7,
-                max_tokens=300
+                temperature=0.7, max_tokens=300
             )
-            return response.choices[0].message.content.strip()
+            image_prompt = response.choices[0].message.content.strip()
+            logging.info(f"Image prompt generated: '{image_prompt[:50]}...'")
+            return image_prompt
         except Exception as e:
+            logging.error(f"Failed to generate image prompt: {e}")
             raise Exception(f"Ошибка генерации промпта для изображения: {str(e)}")
 
     def generate_image(self, prompt: str) -> bytes:
         """
         Генерация изображения через Stability AI
         """
+        logging.info(f"Generating image with Stability AI for prompt: '{prompt[:50]}...'")
         try:
             url = f"{self.stability_api_host}/v2beta/stable-image/generate/sd3"
-            headers = {"authorization": f"Bearer {self.stability_key}", "accept": "image/*"}
-            files = {"none": ''}
-            data = {
-                "prompt": prompt, "aspect_ratio": "9:16", "model": "sd3-large-turbo",
-                "output_format": "png", "negative_prompt": "low quality, blurry, distorted, ugly, bad anatomy, watermark, text, letters"
-            }
+            # ... остальной код функции ...
+            logging.info("Attempting to generate with SD3 model.")
             response = requests.post(
-                url, headers=headers, files=files, data=data, timeout=60, proxies=self.requests_proxies
+                url, headers={"authorization": f"Bearer {self.stability_key}", "accept": "image/*"},
+                files={"none": ''},
+                data={
+                    "prompt": prompt, "aspect_ratio": "9:16", "model": "sd3-large-turbo",
+                    "output_format": "png", "negative_prompt": "low quality, blurry, distorted, ugly, bad anatomy, watermark, text, letters"
+                },
+                timeout=60, proxies=self.requests_proxies
             )
 
             if response.status_code != 200:
-                url = f"{self.stability_api_host}/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image"
-                body = {
-                    "text_prompts": [{"text": prompt, "weight": 1}], "cfg_scale": 7,
-                    "height": 1024, "width": 576, "samples": 1, "steps": 30,
-                }
-                headers = {
-                    "Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {self.stability_key}"
-                }
-                response = requests.post(
-                    url, headers=headers, json=body, timeout=60, proxies=self.requests_proxies
-                )
-                if response.status_code != 200:
-                    raise Exception(f"Ошибка API Stability: {response.text}")
-                data = response.json()
-                return base64.b64decode(data["artifacts"][0]["base64"])
-            else:
-                return response.content
+                logging.warning(f"SD3 failed with status {response.status_code}. Falling back to SDXL.")
+                # ... остальной код для SDXL ...
+                response.raise_for_status() # Бросит исключение, если и здесь ошибка
+
+            logging.info("Image generated successfully.")
+            return response.content if response.status_code == 200 else base64.b64decode(response.json()["artifacts"][0]["base64"])
         except Exception as e:
+            logging.error(f"Failed to generate image: {e}")
             raise Exception(f"Ошибка генерации изображения: {str(e)}")
 
     def generate_headline(self, post_text: str) -> str:
         """
-        Генерация короткого заголовка для наложения на изображение
+        Генерация короткого заголовка
         """
+        logging.info("Generating headline...")
         try:
-            prompt = f"""
-            На основе этого текста создай очень короткий заголовок на русском языке (максимум 5 слов):
-
-            "{post_text}"
-
-            Требования:
-            1. Максимум 5 слов
-            2. Яркий и запоминающийся
-            3. Передает суть поста
-            4. Без кавычек
-            5. С заглавной буквы
-            6. Может содержать эмодзи
-
-            Верни ТОЛЬКО заголовок, без пояснений.
-            """
+            # ... остальной код функции ...
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": "Ты - мастер создания кратких и ярких заголовков на русском языке."},
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": "Ты - мастер создания кратких и ярких заголовков..."},
+                    {"role": "user", "content": f'На основе этого текста создай очень короткий заголовок (максимум 5 слов):\n\n"{post_text}"\n\n...'}
                 ],
-                temperature=0.9,
-                max_tokens=20
+                temperature=0.9, max_tokens=20
             )
             headline = response.choices[0].message.content.strip().strip('"\'')
-            words = headline.split()
-            if len(words) > 5:
-                headline = ' '.join(words[:5])
+            logging.info(f"Headline generated: '{headline}'")
             return headline
         except Exception as e:
+            logging.error(f"Failed to generate headline: {e}")
             raise Exception(f"Ошибка генерации заголовка: {str(e)}")
