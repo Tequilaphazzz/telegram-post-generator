@@ -6,9 +6,12 @@ from openai import OpenAI
 import requests
 import json
 import base64
+import os
 from typing import Optional
-import httpx
 from config import Config
+
+# Диагностическое сообщение. Вы должны увидеть его в консоли при запуске.
+print("--- LOADING CORRECTED ai_generator.py VERSION ---")
 
 
 class AIGenerator:
@@ -22,20 +25,21 @@ class AIGenerator:
             openai_key: API ключ OpenAI
             stability_key: API ключ Stability AI
         """
-        # 2. Правильная инициализация клиента с прокси
-        # Если прокси не нужен, просто удалите http_client
-        # proxy_url = "http://user:password@proxy.example.com:8080"
-        # proxies = {"http://": proxy_url, "https://": proxy_url}
-
-        # Раскомментируйте следующие строки, если вам нужен прокси
-        # http_client = httpx.Client(proxies=proxies)
-        # self.openai_client = OpenAI(api_key=openai_key, http_client=http_client)
-
-        # Если прокси не нужен, оставьте как было:
+        # --- ОКОНЧАТЕЛЬНОЕ ИСПРАВЛЕНИЕ ---
+        # Здесь нет и не может быть аргумента 'proxies'.
+        # Библиотека OpenAI сама использует системные настройки прокси
+        # из переменных окружения (HTTP_PROXY, HTTPS_PROXY), если они есть.
         self.openai_client = OpenAI(api_key=openai_key)
 
         self.stability_key = stability_key
         self.stability_api_host = "https://api.stability.ai"
+
+        # Настраиваем прокси для библиотеки requests (для Stability AI)
+        # Он также будет взят из переменных окружения
+        self.requests_proxies = {
+            "http": os.environ.get("HTTP_PROXY"),
+            "https": os.environ.get("HTTPS_PROXY"),
+        }
 
     def generate_post_text(self, topic: str) -> str:
         """
@@ -76,24 +80,16 @@ class AIGenerator:
 
             post_text = response.choices[0].message.content.strip()
 
-            # Проверка длины
             if len(post_text) > Config.MAX_POST_LENGTH:
                 post_text = post_text[:Config.MAX_POST_LENGTH] + "..."
 
             return post_text
-
         except Exception as e:
             raise Exception(f"Ошибка генерации текста: {str(e)}")
 
     def generate_image_prompt(self, post_text: str) -> str:
         """
         Генерация промпта для создания изображения
-
-        Args:
-            post_text: Текст поста
-
-        Returns:
-            Промпт для генерации изображения
         """
         try:
             prompt = f"""
@@ -122,105 +118,50 @@ class AIGenerator:
                 temperature=0.7,
                 max_tokens=300
             )
-
-            image_prompt = response.choices[0].message.content.strip()
-            return image_prompt
-
+            return response.choices[0].message.content.strip()
         except Exception as e:
             raise Exception(f"Ошибка генерации промпта для изображения: {str(e)}")
 
     def generate_image(self, prompt: str) -> bytes:
         """
         Генерация изображения через Stability AI
-
-        Args:
-            prompt: Промпт для генерации
-
-        Returns:
-            Байты изображения
         """
         try:
-            # Запрос к Stability AI API для SD3
             url = f"{self.stability_api_host}/v2beta/stable-image/generate/sd3"
-
-            headers = {
-                "authorization": f"Bearer {self.stability_key}",
-                "accept": "image/*"
-            }
-
-            files = {
-                "none": ''
-            }
-
+            headers = {"authorization": f"Bearer {self.stability_key}", "accept": "image/*"}
+            files = {"none": ''}
             data = {
-                "prompt": prompt,
-                "aspect_ratio": "9:16",  # Вертикальный формат для stories
-                "model": "sd3-large-turbo",
-                "output_format": "png",
-                "negative_prompt": "low quality, blurry, distorted, ugly, bad anatomy, watermark, text, letters"
+                "prompt": prompt, "aspect_ratio": "9:16", "model": "sd3-large-turbo",
+                "output_format": "png", "negative_prompt": "low quality, blurry, distorted, ugly, bad anatomy, watermark, text, letters"
             }
-
             response = requests.post(
-                url,
-                headers=headers,
-                files=files,
-                data=data,
-                timeout=60
+                url, headers=headers, files=files, data=data, timeout=60, proxies=self.requests_proxies
             )
 
             if response.status_code != 200:
-                # Если SD3 не доступен, пробуем SDXL
                 url = f"{self.stability_api_host}/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image"
-
                 body = {
-                    "text_prompts": [
-                        {
-                            "text": prompt,
-                            "weight": 1
-                        }
-                    ],
-                    "cfg_scale": 7,
-                    "height": 1024,
-                    "width": 576,  # Примерно 9:16
-                    "samples": 1,
-                    "steps": 30,
+                    "text_prompts": [{"text": prompt, "weight": 1}], "cfg_scale": 7,
+                    "height": 1024, "width": 576, "samples": 1, "steps": 30,
                 }
-
                 headers = {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "Authorization": f"Bearer {self.stability_key}"
+                    "Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {self.stability_key}"
                 }
-
                 response = requests.post(
-                    url,
-                    headers=headers,
-                    json=body,
-                    timeout=60
+                    url, headers=headers, json=body, timeout=60, proxies=self.requests_proxies
                 )
-
                 if response.status_code != 200:
                     raise Exception(f"Ошибка API Stability: {response.text}")
-
                 data = response.json()
-                image_data = base64.b64decode(data["artifacts"][0]["base64"])
+                return base64.b64decode(data["artifacts"][0]["base64"])
             else:
-                image_data = response.content
-
-            return image_data
-
+                return response.content
         except Exception as e:
             raise Exception(f"Ошибка генерации изображения: {str(e)}")
 
     def generate_headline(self, post_text: str) -> str:
         """
         Генерация короткого заголовка для наложения на изображение
-
-        Args:
-            post_text: Текст поста
-
-        Returns:
-            Короткий заголовок
         """
         try:
             prompt = f"""
@@ -238,7 +179,6 @@ class AIGenerator:
 
             Верни ТОЛЬКО заголовок, без пояснений.
             """
-
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
@@ -248,18 +188,10 @@ class AIGenerator:
                 temperature=0.9,
                 max_tokens=20
             )
-
-            headline = response.choices[0].message.content.strip()
-
-            # Убираем кавычки, если есть
-            headline = headline.strip('"\'')
-
-            # Проверка длины
+            headline = response.choices[0].message.content.strip().strip('"\'')
             words = headline.split()
             if len(words) > 5:
                 headline = ' '.join(words[:5])
-
             return headline
-
         except Exception as e:
             raise Exception(f"Ошибка генерации заголовка: {str(e)}")

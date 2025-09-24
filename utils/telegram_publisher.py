@@ -24,7 +24,21 @@ class TelegramPublisher:
 
     async def _create_client_and_connect(self) -> TelegramClient:
         """Создает, подключает и возвращает клиент Telethon."""
+
+        # --- ПРАВИЛЬНАЯ НАСТРОЙКА ПРОКСИ ДЛЯ TELETHON ---
+        # Если вам нужен прокси, раскомментируйте и настройте эти строки
+        # proxy_config = {
+        #     'proxy_type': 'socks5', # или 'http'
+        #     'addr': '127.0.0.1',
+        #     'port': 9050,
+        #     # 'username': 'user', # если требуется аутентификация
+        #     # 'password': 'pass'  # если требуется аутентификация
+        # }
+        # client = TelegramClient(self.session_name, self.api_id, self.api_hash, proxy=proxy_config)
+
+        # Если прокси НЕ НУЖЕН, используется строка ниже
         client = TelegramClient(self.session_name, self.api_id, self.api_hash)
+
         await client.connect()
         return client
 
