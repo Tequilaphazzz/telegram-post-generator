@@ -319,8 +319,5 @@ function showMessage(type, message) {
     
     messagesDiv.appendChild(alertDiv);
     
-    // Автоматически удаляем через 5 секунд
-    setTimeout(() => {
-        alertDiv.remove();
-    }, 5000);
+    // Убираем автоматическое удаление - сообщения будут исчезать только при клике на крестик
 }

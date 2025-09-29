@@ -60,8 +60,11 @@ class TelegramPublisher:
 
             entity = await client.get_entity(group_username)
 
+            # Ограничиваем длину текста для подписи (лимит Telegram - 1024 символа)
+            caption_text = text[:1020] + "..." if len(text) > 1020 else text
+
             # Отправка сообщения в группу
-            message = await client.send_message(entity, text, file=image_file)
+            message = await client.send_message(entity, caption_text, file=image_file)
 
             result = {'group_post': {'status': 'success', 'message_id': message.id}}
 
@@ -69,8 +72,11 @@ class TelegramPublisher:
             if publish_to_story:
                 try:
                     image_file.seek(0)
+                    # Для Stories используем еще более короткий текст (рекомендуется до 100 символов)
+                    story_caption = text[:97] + "..." if len(text) > 97 else text
+
                     # В Telethon 1.34 stories публикуются через send_file с флагом is_story=True
-                    await client.send_file('me', image_file, caption=text[:100], is_story=True)
+                    await client.send_file('me', image_file, caption=story_caption, is_story=True)
                     result['story'] = {'status': 'success'}
                 except Exception as story_error:
                     result['story'] = {'status': 'error', 'message': str(story_error)}
