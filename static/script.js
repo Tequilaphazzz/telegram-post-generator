@@ -214,31 +214,91 @@ function resetApprovals() {
 }
 
 // Публикация поста
+// Публикация поста с поддержкой разных типов Stories
 async function publishPost() {
     if (!approvals.text || !approvals.image || !approvals.headline) {
         showMessage('warning', '⚠️ Пожалуйста, одобрите все элементы перед публикацией');
         return;
     }
-    
+
+    // Получаем настройки Stories
+    const skipStories = document.getElementById('skipStories').checked;
+    const storyType = document.querySelector('input[name="storyType"]:checked').value;
+
+    // Формируем сообщение о публикации
+    let publishingMsg = '📤 Публикация в Telegram';
+    if (!skipStories) {
+        if (storyType === 'channel') {
+            publishingMsg += ' (пост + Story в канал)';
+        } else if (storyType === 'personal') {
+            publishingMsg += ' (пост + личная Story)';
+        } else if (storyType === 'both') {
+            publishingMsg += ' (пост + обе Stories)';
+        }
+    } else {
+        publishingMsg += ' (только пост, без Stories)';
+    }
+    publishingMsg += '...';
+
     showLoader();
-    showMessage('info', '📤 Публикация в Telegram...');
-    
+    showMessage('info', publishingMsg);
+
     try {
+        // Подготавливаем данные для отправки
+        const requestData = {
+            story_type: skipStories ? 'none' : storyType
+        };
+
         const response = await fetch('/publish_post', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
-            }
+            },
+            body: JSON.stringify(requestData)
         });
-        
+
         const data = await response.json();
-        
+
         if (data.status === 'success') {
-            showMessage('success', '🎉 Пост успешно опубликован в Telegram!');
+            // Показываем основное сообщение об успехе
+            showMessage('success', '🎉 Публикация завершена успешно!');
+
+            // Показываем детали если есть
+            if (data.details && data.details.length > 0) {
+                let detailsMsg = '<strong>📋 Результаты:</strong><br>';
+                data.details.forEach(detail => {
+                    detailsMsg += `${detail}<br>`;
+                });
+                showMessage('info', detailsMsg);
+            }
+
+            // Показываем предупреждения если есть
+            if (data.warnings && data.warnings.length > 0) {
+                let warningsMsg = '<strong>⚠️ Предупреждения:</strong><br>';
+                data.warnings.forEach(warning => {
+                    warningsMsg += `• ${warning}<br>`;
+                });
+                showMessage('warning', warningsMsg);
+            }
+
+            // Информация о Stories
+            if (!skipStories) {
+                if (storyType === 'channel' || storyType === 'both') {
+                    showMessage('info', `
+                        <strong>📸 О Stories в канале:</strong><br>
+                        • Проверьте Stories в вашем канале/группе<br>
+                        • Если Story не появилась, проверьте права администратора<br>
+                        • Может потребоваться Telegram Premium<br>
+                        • Альтернативно: опубликован специальный Story-пост
+                    `);
+                }
+            }
+
             // Очищаем форму и предпросмотр
             document.getElementById('topic').value = '';
             document.getElementById('previewCard').style.display = 'none';
             resetApprovals();
+
         } else {
             if (data.message.includes('верификация')) {
                 // Показываем модальное окно для ввода кода
@@ -246,6 +306,17 @@ async function publishPost() {
                 modal.show();
             } else {
                 showMessage('danger', `❌ Ошибка публикации: ${data.message}`);
+
+                // Дополнительная помощь при ошибках со Stories
+                if (data.message.includes('Story') || data.message.includes('story')) {
+                    showMessage('info', `
+                        <strong>💡 Возможные решения:</strong><br>
+                        • Попробуйте опубликовать только пост (отметьте "Пропустить Stories")<br>
+                        • Проверьте права администратора в канале<br>
+                        • Убедитесь, что у вас есть Telegram Premium (для Stories в каналах)<br>
+                        • Попробуйте личную Story вместо канала
+                    `);
+                }
             }
         }
     } catch (error) {
@@ -254,6 +325,39 @@ async function publishPost() {
         hideLoader();
     }
 }
+
+// Добавляем функцию проверки поддержки Stories
+async function checkStorySupport() {
+    const telegram_group = document.getElementById('telegram_group').value;
+
+    if (!telegram_group) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/check_story_support', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ group_username: telegram_group })
+        });
+
+        const data = await response.json();
+
+        if (data.status === 'success' && data.info) {
+            // Обновляем UI в зависимости от поддержки Stories
+            if (!data.info.supports_stories) {
+                showMessage('info', 'ℹ️ Этот канал/группа может не поддерживать Stories. Будет использован альтернативный метод.');
+            }
+        }
+    } catch (error) {
+        console.error('Ошибка проверки поддержки Stories:', error);
+    }
+}
+
+// Вызываем проверку при изменении группы
+document.getElementById('telegram_group').addEventListener('blur', checkStorySupport);
 
 // Подтверждение кода Telegram
 document.getElementById('codeForm').addEventListener('submit', async function(e) {

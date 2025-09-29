@@ -129,7 +129,53 @@
                             <li>Заголовок: <span id="headlineApproval" class="badge bg-secondary">Ожидает</span></li>
                         </ul>
                     </div>
+                    <!-- Добавьте этот блок в секцию "Статус одобрения" перед кнопкой публикации -->
 
+                    <!-- Настройки публикации Stories -->
+                    <div class="mt-3 mb-3">
+                        <div class="card">
+                            <div class="card-body">
+                                <h6>📸 Настройки Stories</h6>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="radio" name="storyType" id="storyChannel" value="channel" checked>
+                                    <label class="form-check-label" for="storyChannel">
+                                        📢 Story в канал/группу
+                                        <small class="text-muted">(требуются права администратора)</small>
+                                    </label>
+                                </div>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="radio" name="storyType" id="storyPersonal" value="personal">
+                                    <label class="form-check-label" for="storyPersonal">
+                                        👤 Личная Story
+                                        <small class="text-muted">(в вашем профиле)</small>
+                                    </label>
+                                </div>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="radio" name="storyType" id="storyBoth" value="both">
+                                    <label class="form-check-label" for="storyBoth">
+                                        🎯 Обе Stories
+                                        <small class="text-muted">(канал и личная)</small>
+                                    </label>
+                                </div>
+                                <div class="form-check mt-2">
+                                    <input class="form-check-input" type="checkbox" id="skipStories">
+                                    <label class="form-check-label" for="skipStories">
+                                        ⏭️ Пропустить Stories (только пост)
+                                    </label>
+                                </div>
+
+                                <!-- Информация о Stories -->
+                                <div class="alert alert-info mt-3 mb-0">
+                                    <small>
+                                        <strong>ℹ️ Информация о Stories:</strong><br>
+                                        • Stories в каналах могут требовать Telegram Premium<br>
+                                        • Если Story не публикуется, будет создан специальный пост<br>
+                                        • Stories доступны 24 часа после публикации
+                                    </small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                     <button class="btn btn-primary btn-lg" id="publishBtn" disabled onclick="publishPost()">
                         📤 Опубликовать в Telegram
                     </button>
