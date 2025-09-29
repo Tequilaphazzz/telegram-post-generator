@@ -45,7 +45,7 @@ class TelegramPublisher:
         print(f"   Телефон: {self.phone}")
 
     async def connect(self):
-        """Подключение к Telegram"""
+        """Подключение к Telegram с правильной обработкой авторизации"""
         try:
             if not self.client:
                 print("🔄 Создание нового клиента Telegram...")
@@ -58,16 +58,62 @@ class TelegramPublisher:
             print("🔄 Подключение к Telegram...")
             await self.client.connect()
 
-            if not await self.client.is_user_authorized():
-                print("📱 Требуется авторизация. Отправка кода...")
-                await self.client.send_code_request(self.phone)
-                return False
+            # Проверяем авторизацию
+            is_authorized = await self.client.is_user_authorized()
 
-            print("✅ Успешно подключено и авторизовано")
+            if not is_authorized:
+                print("📱 Не авторизован. Отправка кода подтверждения...")
+                try:
+                    # Отправляем запрос на код
+                    await self.client.send_code_request(self.phone)
+                    print("✅ Код отправлен на номер " + self.phone)
+                    print("⏳ Ожидание ввода кода в веб-интерфейсе...")
+
+                    # Возвращаем False чтобы указать что требуется код
+                    return False
+
+                except Exception as e:
+                    error_msg = str(e)
+                    print(f"❌ Ошибка отправки кода: {error_msg}")
+
+                    # Проверяем тип ошибки
+                    if "flood" in error_msg.lower():
+                        raise Exception("Слишком много попыток. Подождите перед повторной попыткой.")
+                    elif "phone_number_invalid" in error_msg.lower():
+                        raise Exception(f"Неверный номер телефона: {self.phone}")
+                    elif "api_id_invalid" in error_msg.lower():
+                        raise Exception("Неверная комбинация API ID/Hash")
+                    else:
+                        raise
+
+            # Если авторизованы, получаем информацию о пользователе
+            print("✅ Уже авторизован. Получение информации...")
+            me = await self.client.get_me()
+            print(f"👤 Вы вошли как: {me.first_name} {me.last_name or ''}")
+
+            if hasattr(me, 'username') and me.username:
+                print(f"   Username: @{me.username}")
+
+            if hasattr(me, 'premium') and me.premium:
+                print("   💎 Telegram Premium: Да")
+
             return True
 
         except Exception as e:
-            print(f"❌ Ошибка подключения: {str(e)}")
+            error_msg = str(e)
+            print(f"❌ Ошибка подключения: {error_msg}")
+
+            # Детальная диагностика
+            if "api_id" in error_msg.lower() or "api_hash" in error_msg.lower():
+                print("\n⚠️ Проблема с API credentials:")
+                print("1. Проверьте правильность API ID и API Hash")
+                print("2. Убедитесь, что используете credentials от my.telegram.org")
+                print("3. API ID должен быть числом")
+                print(f"\nВаш API ID: {self.api_id} (тип: {type(self.api_id).__name__})")
+            elif "phone" in error_msg.lower():
+                print(f"\n⚠️ Проблема с номером телефона: {self.phone}")
+                print("Номер должен быть в формате: +7XXXXXXXXXX")
+
             raise
 
     async def verify_code(self, code: str):

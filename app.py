@@ -9,7 +9,7 @@ import base64
 from datetime import datetime
 import asyncio
 import threading
-
+import queue
 from utils.ai_generator import AIGenerator
 from utils.image_processor import ImageProcessor
 from utils.telegram_publisher import TelegramPublisher
@@ -292,10 +292,10 @@ def regenerate_content():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/publish_post', methods=['POST'])
+
 @app.route('/publish_post', methods=['POST'])
 def publish_post():
-    """Публикация поста в Telegram с улучшенной поддержкой Stories"""
+    """Публикация поста в Telegram с правильной обработкой авторизации"""
     global current_post_data
 
     try:
@@ -303,7 +303,7 @@ def publish_post():
             return jsonify({'status': 'error', 'message': 'Нет данных для публикации'}), 400
 
         data = request.json
-        story_type = data.get('story_type', 'channel')  # 'channel', 'personal', или 'both'
+        story_type = data.get('story_type', 'channel')
 
         config = load_config()
 
@@ -318,61 +318,247 @@ def publish_post():
                     'message': f'Telegram API ID должен быть числом. Проверьте конфигурацию.'
                 }), 500
 
-        print(f"📤 Публикация с API ID: {api_id}")
-        print(f"📸 Тип Stories: {story_type}")
+        print(f"📤 Попытка публикации...")
+        print(f"   API ID: {api_id}")
+        print(f"   Группа: {config.get('telegram_group')}")
+        print(f"   Тип Stories: {story_type}")
+
+        # Используем очередь для получения результата из thread
+        result_queue = queue.Queue()
+        error_queue = queue.Queue()
 
         # Асинхронная публикация в Telegram
         def run_async_publish():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
 
-            publisher = TelegramPublisher(
-                api_id=str(api_id),
-                api_hash=config.get('telegram_api_hash'),
-                phone=config.get('telegram_phone')
-            )
-
-            result = loop.run_until_complete(
-                publisher.publish_post(
-                    group_username=config.get('telegram_group'),
-                    text=current_post_data['text'],
-                    image=current_post_data['image'],
-                    publish_to_story=True,
-                    story_type=story_type  # Передаём тип Story
+                publisher = TelegramPublisher(
+                    api_id=str(api_id),
+                    api_hash=config.get('telegram_api_hash'),
+                    phone=config.get('telegram_phone')
                 )
-            )
-            return result
+
+                # Сначала проверяем подключение
+                connected = loop.run_until_complete(publisher.connect())
+
+                if not connected:
+                    # Требуется авторизация
+                    print("⚠️ Требуется авторизация")
+                    error_queue.put({
+                        'type': 'auth_required',
+                        'message': 'Требуется код подтверждения из Telegram'
+                    })
+                    return
+
+                # Если подключены, публикуем
+                result = loop.run_until_complete(
+                    publisher.publish_post(
+                        group_username=config.get('telegram_group'),
+                        text=current_post_data['text'],
+                        image=current_post_data['image'],
+                        publish_to_story=True,
+                        story_type=story_type
+                    )
+                )
+
+                result_queue.put(result)
+
+            except Exception as e:
+                error_msg = str(e)
+                print(f"❌ Ошибка в thread: {error_msg}")
+
+                # Проверяем тип ошибки
+                if "требуется верификация" in error_msg.lower() or "send_code_request" in error_msg.lower():
+                    error_queue.put({
+                        'type': 'auth_required',
+                        'message': 'Требуется код подтверждения из Telegram'
+                    })
+                else:
+                    error_queue.put({
+                        'type': 'error',
+                        'message': error_msg
+                    })
 
         # Запуск в отдельном потоке
         thread = threading.Thread(target=run_async_publish)
         thread.start()
-        thread.join(timeout=60)  # Увеличиваем таймаут для Stories
-
-        # Формируем детальный ответ
-        success_messages = []
-        warnings = []
+        thread.join(timeout=30)  # Ждём максимум 30 секунд
 
         # Проверяем результаты
-        if current_post_data:  # Проверяем, что данные ещё есть
-            success_messages.append('✅ Пост опубликован в группу/канал')
+        if not error_queue.empty():
+            error = error_queue.get()
 
-            # Можно добавить проверку результатов Stories если thread вернул результат
-            # Но так как это асинхронно, просто информируем пользователя
-            if story_type == 'channel':
-                success_messages.append('📸 Story отправлена в канал (проверьте Telegram)')
-            elif story_type == 'personal':
-                success_messages.append('📸 Личная Story опубликована')
-            elif story_type == 'both':
-                success_messages.append('📸 Stories опубликованы (личная и в канал)')
+            if error['type'] == 'auth_required':
+                # Требуется авторизация
+                print("📱 Требуется код подтверждения")
+                return jsonify({
+                    'status': 'auth_required',
+                    'message': 'Требуется код подтверждения. Проверьте Telegram.',
+                    'need_code': True
+                })
+            else:
+                # Другая ошибка
+                return jsonify({
+                    'status': 'error',
+                    'message': error['message']
+                }), 500
 
-        return jsonify({
-            'status': 'success',
-            'message': 'Публикация завершена!',
-            'details': success_messages,
-            'warnings': warnings
-        })
+        elif not result_queue.empty():
+            # Получили результат
+            result = result_queue.get()
+
+            # Формируем детальный ответ
+            success_messages = []
+            warnings = []
+
+            if 'group_post' in result and result['group_post'].get('status') == 'success':
+                success_messages.append(
+                    f'✅ Пост опубликован в группу/канал (ID: {result["group_post"].get("message_id")})')
+            else:
+                warnings.append('Не удалось опубликовать пост в группу')
+
+            # Проверяем Stories
+            if 'channel_story' in result:
+                if result['channel_story'].get('status') == 'success':
+                    if result['channel_story'].get('type') == 'story_post':
+                        success_messages.append('📸 Story опубликована как специальный пост')
+                    else:
+                        success_messages.append('📸 Story опубликована в канал')
+                else:
+                    warnings.append(f'Story в канал: {result["channel_story"].get("error", "ошибка")}')
+
+            if 'personal_story' in result:
+                if result['personal_story'].get('status') == 'success':
+                    success_messages.append('📸 Личная Story опубликована')
+                else:
+                    warnings.append(f'Личная Story: {result["personal_story"].get("error", "ошибка")}')
+
+            if success_messages:
+                return jsonify({
+                    'status': 'success',
+                    'message': 'Публикация завершена!',
+                    'details': success_messages,
+                    'warnings': warnings
+                })
+            else:
+                return jsonify({
+                    'status': 'partial',
+                    'message': 'Публикация завершена с ошибками',
+                    'warnings': warnings
+                })
+
+        elif thread.is_alive():
+            # Thread всё ещё работает (превышен таймаут)
+            return jsonify({
+                'status': 'timeout',
+                'message': 'Превышено время ожидания. Проверьте Telegram.',
+                'need_retry': True
+            })
+        else:
+            # Thread завершился без результата и без ошибки
+            print("⚠️ Thread завершился без результата")
+            return jsonify({
+                'status': 'unknown',
+                'message': 'Статус публикации неизвестен. Проверьте Telegram.',
+                'need_check': True
+            })
 
     except Exception as e:
+        print(f"❌ Критическая ошибка: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/verify_telegram_code', methods=['POST'])
+def verify_telegram_code():
+    """Верификация кода Telegram с улучшенной обработкой"""
+    try:
+        data = request.json
+        code = data.get('code')
+
+        if not code:
+            return jsonify({
+                'status': 'error',
+                'message': 'Код не указан'
+            }), 400
+
+        config = load_config()
+
+        # Проверяем тип telegram_api_id
+        api_id = config.get('telegram_api_id')
+        if api_id and isinstance(api_id, str):
+            try:
+                api_id = int(api_id)
+            except ValueError:
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Telegram API ID должен быть числом. Проверьте конфигурацию.'
+                }), 500
+
+        print(f"🔐 Верификация кода: {code}")
+
+        # Используем очередь для результата
+        result_queue = queue.Queue()
+        error_queue = queue.Queue()
+
+        def run_async_verify():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+                publisher = TelegramPublisher(
+                    api_id=str(api_id),
+                    api_hash=config.get('telegram_api_hash'),
+                    phone=config.get('telegram_phone')
+                )
+
+                result = loop.run_until_complete(
+                    publisher.verify_code(code)
+                )
+
+                result_queue.put(result)
+
+            except Exception as e:
+                error_queue.put(str(e))
+
+        thread = threading.Thread(target=run_async_verify)
+        thread.start()
+        thread.join(timeout=15)
+
+        if not error_queue.empty():
+            error = error_queue.get()
+            print(f"❌ Ошибка верификации: {error}")
+
+            if "password" in str(error).lower() or "2fa" in str(error).lower():
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Требуется пароль 2FA. Временно отключите двухфакторную аутентификацию.',
+                    'need_2fa': True
+                }), 400
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'Ошибка верификации: {error}'
+                }), 400
+
+        elif not result_queue.empty():
+            result = result_queue.get()
+            print("✅ Код подтверждён")
+
+            return jsonify({
+                'status': 'success',
+                'message': 'Код подтвержден! Теперь можно публиковать.',
+                'retry_publish': True  # Сигнал для повторной публикации
+            })
+
+        else:
+            return jsonify({
+                'status': 'timeout',
+                'message': 'Превышено время ожидания верификации'
+            }), 408
+
+    except Exception as e:
+        print(f"❌ Критическая ошибка верификации: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 

@@ -213,26 +213,35 @@ function resetApprovals() {
     updateApprovalStatus();
 }
 
-// Публикация поста
-// Публикация поста с поддержкой разных типов Stories
-async function publishPost() {
-    if (!approvals.text || !approvals.image || !approvals.headline) {
-        showMessage('warning', '⚠️ Пожалуйста, одобрите все элементы перед публикацией');
-        return;
-    }
+// Глобальная переменная для хранения данных публикации
+let pendingPublishData = null;
 
-    // Получаем настройки Stories
-    const skipStories = document.getElementById('skipStories').checked;
-    const storyType = document.querySelector('input[name="storyType"]:checked').value;
+// Публикация поста с правильной обработкой авторизации
+async function publishPost(isRetry = false) {
+    // Если это не повторная попытка, проверяем одобрения
+    if (!isRetry) {
+        if (!approvals.text || !approvals.image || !approvals.headline) {
+            showMessage('warning', '⚠️ Пожалуйста, одобрите все элементы перед публикацией');
+            return;
+        }
+
+        // Сохраняем данные для возможной повторной публикации
+        const skipStories = document.getElementById('skipStories').checked;
+        const storyType = document.querySelector('input[name="storyType"]:checked').value;
+
+        pendingPublishData = {
+            story_type: skipStories ? 'none' : storyType
+        };
+    }
 
     // Формируем сообщение о публикации
     let publishingMsg = '📤 Публикация в Telegram';
-    if (!skipStories) {
-        if (storyType === 'channel') {
+    if (pendingPublishData.story_type !== 'none') {
+        if (pendingPublishData.story_type === 'channel') {
             publishingMsg += ' (пост + Story в канал)';
-        } else if (storyType === 'personal') {
+        } else if (pendingPublishData.story_type === 'personal') {
             publishingMsg += ' (пост + личная Story)';
-        } else if (storyType === 'both') {
+        } else if (pendingPublishData.story_type === 'both') {
             publishingMsg += ' (пост + обе Stories)';
         }
     } else {
@@ -244,26 +253,22 @@ async function publishPost() {
     showMessage('info', publishingMsg);
 
     try {
-        // Подготавливаем данные для отправки
-        const requestData = {
-            story_type: skipStories ? 'none' : storyType
-        };
-
         const response = await fetch('/publish_post', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify(requestData)
+            body: JSON.stringify(pendingPublishData)
         });
 
         const data = await response.json();
 
+        // Обрабатываем разные статусы
         if (data.status === 'success') {
-            // Показываем основное сообщение об успехе
+            // Успешная публикация
             showMessage('success', '🎉 Публикация завершена успешно!');
 
-            // Показываем детали если есть
+            // Показываем детали
             if (data.details && data.details.length > 0) {
                 let detailsMsg = '<strong>📋 Результаты:</strong><br>';
                 data.details.forEach(detail => {
@@ -272,7 +277,7 @@ async function publishPost() {
                 showMessage('info', detailsMsg);
             }
 
-            // Показываем предупреждения если есть
+            // Показываем предупреждения
             if (data.warnings && data.warnings.length > 0) {
                 let warningsMsg = '<strong>⚠️ Предупреждения:</strong><br>';
                 data.warnings.forEach(warning => {
@@ -281,50 +286,168 @@ async function publishPost() {
                 showMessage('warning', warningsMsg);
             }
 
-            // Информация о Stories
-            if (!skipStories) {
-                if (storyType === 'channel' || storyType === 'both') {
-                    showMessage('info', `
-                        <strong>📸 О Stories в канале:</strong><br>
-                        • Проверьте Stories в вашем канале/группе<br>
-                        • Если Story не появилась, проверьте права администратора<br>
-                        • Может потребоваться Telegram Premium<br>
-                        • Альтернативно: опубликован специальный Story-пост
-                    `);
-                }
+            // Очищаем форму после успешной публикации
+            clearAfterPublish();
+
+        } else if (data.status === 'auth_required' || data.need_code) {
+            // Требуется авторизация
+            hideLoader();
+            showMessage('info', '📱 Требуется код подтверждения из Telegram');
+
+            // Автоматически показываем модальное окно для кода
+            const modal = new bootstrap.Modal(document.getElementById('telegramCodeModal'));
+            modal.show();
+
+            // Обновляем обработчик формы для повторной публикации после верификации
+            document.getElementById('codeForm').onsubmit = async function(e) {
+                e.preventDefault();
+                await verifyCodeAndRetryPublish();
+            };
+
+        } else if (data.status === 'partial') {
+            // Частичный успех
+            showMessage('warning', '⚠️ Публикация завершена с ошибками');
+
+            if (data.warnings && data.warnings.length > 0) {
+                let warningsMsg = '<strong>Ошибки:</strong><br>';
+                data.warnings.forEach(warning => {
+                    warningsMsg += `• ${warning}<br>`;
+                });
+                showMessage('danger', warningsMsg);
             }
 
-            // Очищаем форму и предпросмотр
-            document.getElementById('topic').value = '';
-            document.getElementById('previewCard').style.display = 'none';
-            resetApprovals();
+            clearAfterPublish();
+
+        } else if (data.status === 'timeout') {
+            // Таймаут
+            showMessage('warning', '⏱️ Превышено время ожидания');
+            showMessage('info', 'Проверьте Telegram. Если пост не опубликован, попробуйте ещё раз.');
+
+            // Предлагаем повторить
+            if (confirm('Попробовать опубликовать ещё раз?')) {
+                await publishPost(true);
+            }
+
+        } else if (data.status === 'unknown') {
+            // Неизвестный статус
+            showMessage('warning', '❓ Статус публикации неизвестен');
+            showMessage('info', 'Проверьте Telegram. Возможно, пост был опубликован.');
 
         } else {
-            if (data.message.includes('верификация')) {
-                // Показываем модальное окно для ввода кода
+            // Ошибка
+            showMessage('danger', `❌ Ошибка: ${data.message || 'Неизвестная ошибка'}`);
+
+            // Если ошибка связана с авторизацией
+            if (data.message && (
+                data.message.includes('верификация') ||
+                data.message.includes('авторизация') ||
+                data.message.includes('код')
+            )) {
+                // Показываем модальное окно для кода
                 const modal = new bootstrap.Modal(document.getElementById('telegramCodeModal'));
                 modal.show();
-            } else {
-                showMessage('danger', `❌ Ошибка публикации: ${data.message}`);
-
-                // Дополнительная помощь при ошибках со Stories
-                if (data.message.includes('Story') || data.message.includes('story')) {
-                    showMessage('info', `
-                        <strong>💡 Возможные решения:</strong><br>
-                        • Попробуйте опубликовать только пост (отметьте "Пропустить Stories")<br>
-                        • Проверьте права администратора в канале<br>
-                        • Убедитесь, что у вас есть Telegram Premium (для Stories в каналах)<br>
-                        • Попробуйте личную Story вместо канала
-                    `);
-                }
             }
         }
+
     } catch (error) {
-        showMessage('danger', `❌ Ошибка: ${error.message}`);
+        showMessage('danger', `❌ Ошибка сети: ${error.message}`);
+
+        // Предлагаем повторить
+        if (confirm('Произошла ошибка сети. Попробовать ещё раз?')) {
+            await publishPost(true);
+        }
+
     } finally {
         hideLoader();
     }
 }
+
+// Верификация кода и повторная публикация
+async function verifyCodeAndRetryPublish() {
+    const code = document.getElementById('telegram_code').value.trim();
+
+    if (!code) {
+        showMessage('warning', '⚠️ Введите код подтверждения');
+        return;
+    }
+
+    showLoader();
+    showMessage('info', '🔐 Проверка кода...');
+
+    try {
+        const response = await fetch('/verify_telegram_code', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ code })
+        });
+
+        const data = await response.json();
+
+        if (data.status === 'success') {
+            showMessage('success', '✅ Код подтвержден!');
+
+            // Закрываем модальное окно
+            const modal = bootstrap.Modal.getInstance(document.getElementById('telegramCodeModal'));
+            modal.hide();
+
+            // Очищаем поле кода
+            document.getElementById('telegram_code').value = '';
+
+            // Если нужно повторить публикацию
+            if (data.retry_publish && pendingPublishData) {
+                showMessage('info', '🔄 Повторная попытка публикации...');
+                setTimeout(() => {
+                    publishPost(true);
+                }, 1000);
+            }
+
+        } else {
+            showMessage('danger', `❌ ${data.message || 'Неверный код'}`);
+
+            if (data.need_2fa) {
+                showMessage('warning', '🔐 Требуется пароль двухфакторной аутентификации');
+                showMessage('info', 'Временно отключите 2FA в настройках Telegram и попробуйте снова');
+            }
+        }
+
+    } catch (error) {
+        showMessage('danger', `❌ Ошибка верификации: ${error.message}`);
+    } finally {
+        hideLoader();
+    }
+}
+
+// Очистка после успешной публикации
+function clearAfterPublish() {
+    // Очищаем форму и предпросмотр
+    document.getElementById('topic').value = '';
+    document.getElementById('previewCard').style.display = 'none';
+    resetApprovals();
+    pendingPublishData = null;
+}
+
+// Обновляем обработчик формы с кодом (если он уже есть)
+document.addEventListener('DOMContentLoaded', function() {
+    const codeForm = document.getElementById('codeForm');
+    if (codeForm) {
+        codeForm.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            await verifyCodeAndRetryPublish();
+        });
+    }
+});
+
+// Добавляем обработчик для кнопки публикации
+document.addEventListener('DOMContentLoaded', function() {
+    const publishBtn = document.getElementById('publishBtn');
+    if (publishBtn) {
+        publishBtn.onclick = function() {
+            publishPost(false);
+        };
+    }
+});
 
 // Добавляем функцию проверки поддержки Stories
 async function checkStorySupport() {
