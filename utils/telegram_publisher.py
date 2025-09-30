@@ -1,18 +1,22 @@
 """
 Модуль для публикации постов в Telegram с поддержкой Stories каналов
+ИСПРАВЛЕНА ОШИБКА: table version already exists
 """
-from telethon import TelegramClient, events
-from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.functions.stories import SendStoryRequest, CanSendStoryRequest
 from telethon.tl.types import InputMediaUploadedPhoto, InputPrivacyValueAllowAll
-from telethon.tl.types import MessageMediaPhoto
 import asyncio
 import io
 from typing import Optional, Dict, Any
-from config import Config
+import os
+import json
 
 class TelegramPublisher:
     """Класс для публикации в Telegram"""
+
+    # Глобальное хранилище сессий
+    _session_store_file = 'telegram_sessions.json'
 
     def __init__(self, api_id: str, api_hash: str, phone: str):
         """
@@ -38,22 +42,69 @@ class TelegramPublisher:
             self.phone = '+' + self.phone
 
         self.client = None
-        self.session_name = 'telegram_session'
+
+        # Загружаем или создаем string session
+        self.session_string = self._load_session()
 
         print(f"✅ Telegram Publisher инициализирован:")
         print(f"   API ID: {self.api_id}")
         print(f"   Телефон: {self.phone}")
+        print(f"   Сессия: {'Существующая' if self.session_string else 'Новая'}")
+
+    def _load_session(self) -> str:
+        """Загрузка сохраненной сессии"""
+        try:
+            if os.path.exists(self._session_store_file):
+                with open(self._session_store_file, 'r') as f:
+                    sessions = json.load(f)
+                    return sessions.get(self.phone, '')
+            return ''
+        except:
+            return ''
+
+    def _save_session(self, session_string: str):
+        """Сохранение сессии"""
+        try:
+            sessions = {}
+            if os.path.exists(self._session_store_file):
+                with open(self._session_store_file, 'r') as f:
+                    sessions = json.load(f)
+
+            sessions[self.phone] = session_string
+
+            with open(self._session_store_file, 'w') as f:
+                json.dump(sessions, f, indent=2)
+
+            print("💾 Сессия сохранена")
+        except Exception as e:
+            print(f"⚠️ Не удалось сохранить сессию: {e}")
 
     async def connect(self):
-        """Подключение к Telegram с правильной обработкой авторизации"""
+        """Подключение к Telegram с использованием StringSession"""
         try:
-            if not self.client:
-                print("🔄 Создание нового клиента Telegram...")
-                self.client = TelegramClient(
-                    self.session_name,
-                    self.api_id,
-                    self.api_hash
-                )
+            # Закрываем старый клиент если есть
+            if self.client and self.client.is_connected():
+                await self.client.disconnect()
+                print("🔌 Старое соединение закрыто")
+
+            print("🔄 Создание нового клиента Telegram...")
+
+            # Используем StringSession вместо SQLite
+            if self.session_string:
+                session = StringSession(self.session_string)
+                print("📂 Использую сохраненную сессию")
+            else:
+                session = StringSession()
+                print("🆕 Создаю новую сессию")
+
+            self.client = TelegramClient(
+                session,
+                self.api_id,
+                self.api_hash,
+                connection_retries=5,
+                retry_delay=1,
+                timeout=30
+            )
 
             print("🔄 Подключение к Telegram...")
             await self.client.connect()
@@ -78,11 +129,11 @@ class TelegramPublisher:
 
                     # Проверяем тип ошибки
                     if "flood" in error_msg.lower():
-                        raise Exception("Слишком много попыток. Подождите перед повторной попыткой.")
+                        raise Exception("Слишком много попыток. Подождите несколько минут перед повторной попыткой.")
                     elif "phone_number_invalid" in error_msg.lower():
                         raise Exception(f"Неверный номер телефона: {self.phone}")
                     elif "api_id_invalid" in error_msg.lower():
-                        raise Exception("Неверная комбинация API ID/Hash")
+                        raise Exception("Неверная комбинация API ID/Hash. Проверьте credentials на my.telegram.org")
                     else:
                         raise
 
@@ -96,6 +147,11 @@ class TelegramPublisher:
 
             if hasattr(me, 'premium') and me.premium:
                 print("   💎 Telegram Premium: Да")
+
+            # Сохраняем сессию после успешного подключения
+            if not self.session_string:
+                self.session_string = self.client.session.save()
+                self._save_session(self.session_string)
 
             return True
 
@@ -123,21 +179,60 @@ class TelegramPublisher:
         Args:
             code: Код из Telegram
         """
-        if not self.client:
-            await self.connect()
-
         try:
+            # Проверяем наличие клиента
+            if not self.client:
+                print("⚠️ Клиент не инициализирован, создаем новый...")
+                await self.connect()
+
+            # Проверяем подключение
+            if not self.client.is_connected():
+                print("⚠️ Клиент не подключен, подключаемся...")
+                await self.client.connect()
+
             print(f"🔐 Попытка входа с кодом: {code}")
+
+            # Очищаем код от пробелов и дефисов
+            code = code.strip().replace(' ', '').replace('-', '')
+
+            if len(code) != 5:
+                raise Exception(f"Код должен содержать 5 цифр, получено: {len(code)} символов")
+
+            # Пробуем войти с кодом
             await self.client.sign_in(self.phone, code)
+
             print("✅ Код подтвержден успешно")
+
+            # Получаем информацию о пользователе для подтверждения
+            me = await self.client.get_me()
+            print(f"👤 Авторизован как: {me.first_name}")
+
+            # ВАЖНО: Сохраняем новую сессию после успешной авторизации
+            self.session_string = self.client.session.save()
+            self._save_session(self.session_string)
+            print("💾 Новая сессия сохранена")
+
             return True
+
         except Exception as e:
             error_msg = str(e)
             print(f"❌ Ошибка верификации: {error_msg}")
 
-            if "password" in error_msg.lower():
+            # Детальные сообщения об ошибках
+            if "password" in error_msg.lower() or "2fa" in error_msg.lower():
                 print("⚠️ Требуется пароль двухфакторной аутентификации")
-                raise Exception("Требуется 2FA пароль. Временно отключите 2FA в настройках Telegram")
+                raise Exception("Требуется 2FA пароль. Временно отключите 2FA в настройках Telegram и попробуйте снова.")
+            elif "phone_code_invalid" in error_msg.lower():
+                raise Exception("Неверный код. Проверьте код из Telegram и попробуйте снова. Код должен состоять из 5 цифр.")
+            elif "phone_code_expired" in error_msg.lower():
+                raise Exception("Код истек. Запросите новый код и попробуйте снова.")
+            elif "phone_code_empty" in error_msg.lower():
+                raise Exception("Код не может быть пустым.")
+            elif "session_revoked" in error_msg.lower():
+                # Удаляем поврежденную сессию
+                self.session_string = ''
+                self._save_session('')
+                raise Exception("Сессия отозвана. Попробуйте авторизоваться заново.")
 
             raise Exception(f"Ошибка верификации: {error_msg}")
 
@@ -158,14 +253,11 @@ class TelegramPublisher:
 
             # Проверяем права администратора
             try:
-                # Получаем информацию о правах в канале
                 chat_entity = await self.client.get_entity(channel_entity)
 
-                # Проверяем, является ли пользователь администратором
                 if hasattr(chat_entity, 'admin_rights') and chat_entity.admin_rights:
                     print("✅ Права администратора подтверждены")
 
-                    # Проверяем право на публикацию stories
                     if hasattr(chat_entity.admin_rights, 'post_stories') and not chat_entity.admin_rights.post_stories:
                         print("❌ У вас нет прав на публикацию Stories в этом канале")
                         return {
@@ -173,14 +265,12 @@ class TelegramPublisher:
                             'error': 'Нет прав на публикацию Stories. Проверьте права администратора.'
                         }
                 else:
-                    # Для обычных групп пробуем получить участника
                     try:
                         me = await self.client.get_me()
                         participant = await self.client.get_permissions(channel_entity, me)
 
                         if not participant.is_admin:
                             print("⚠️ Вы не администратор в этой группе")
-                            # Продолжаем попытку, так как в некоторых группах это может работать
                     except:
                         print("⚠️ Не удалось проверить права администратора")
             except Exception as e:
@@ -191,51 +281,38 @@ class TelegramPublisher:
             image_file.name = 'story_image.png'
             image_file.seek(0)
 
-            # Загружаем файл на сервера Telegram
             print("📤 Загрузка изображения...")
             uploaded_file = await self.client.upload_file(image_file)
 
-            # Создаем медиа объект
             media = InputMediaUploadedPhoto(file=uploaded_file)
 
             # Проверяем возможность отправки Story
             try:
-                # Проверяем, можем ли отправить Story в этот чат
-                from telethon.tl.functions.stories import CanSendStoryRequest
-
                 can_send = await self.client(CanSendStoryRequest(
                     peer=channel_entity
                 ))
 
                 if not can_send:
                     print("❌ Не можем отправить Story в этот чат")
-
-                    # Альтернативный метод - публикуем как обычный пост с хештегом
                     print("🔄 Пробуем альтернативный метод...")
                     return await self._publish_as_story_post(channel_entity, image, caption)
             except Exception as e:
                 print(f"⚠️ CanSendStoryRequest не поддерживается: {e}")
 
-            # Отправляем Story в канал
-            from telethon.tl.functions.stories import SendStoryRequest
-            from telethon.tl.types import InputPrivacyValueAllowAll
-
-            # Правила приватности для публичной Story
             privacy_rules = [InputPrivacyValueAllowAll()]
 
-            # Ограничиваем длину подписи
             if len(caption) > 200:
                 caption = caption[:197] + "..."
 
             print("📤 Отправка Story в канал...")
             result = await self.client(SendStoryRequest(
-                peer=channel_entity,  # Указываем канал/группу как получателя
+                peer=channel_entity,
                 media=media,
                 caption=caption,
                 privacy_rules=privacy_rules,
-                pinned=False,  # Не закрепляем
-                noforwards=False,  # Разрешаем пересылку
-                period=86400  # 24 часа
+                pinned=False,
+                noforwards=False,
+                period=86400
             ))
 
             print("✅ Story успешно опубликована в канале!")
@@ -250,7 +327,6 @@ class TelegramPublisher:
             error_msg = str(e)
             print(f"❌ Ошибка публикации Story в канал: {error_msg}")
 
-            # Анализируем ошибку
             if "STORIES_TOO_MUCH" in error_msg:
                 return {
                     'status': 'error',
@@ -267,7 +343,6 @@ class TelegramPublisher:
                     'error': 'Требуются права администратора для публикации Stories.'
                 }
             elif "PEER_ID_INVALID" in error_msg:
-                # Если не удалось опубликовать Story, пробуем альтернативный метод
                 print("🔄 Пробуем альтернативный метод публикации...")
                 return await self._publish_as_story_post(channel_entity, image, caption)
             else:
@@ -291,15 +366,12 @@ class TelegramPublisher:
         try:
             print("📱 Публикация как Story-подобный пост...")
 
-            # Форматируем текст как Story
             story_text = f"📸 **STORY** 📸\n\n{caption}\n\n⏰ _Доступно 24 часа_\n\n#story #{entity.username if hasattr(entity, 'username') and entity.username else 'story'}"
 
-            # Загружаем изображение
             image_file = io.BytesIO(image)
             image_file.name = 'story_post.png'
             image_file.seek(0)
 
-            # Отправляем как обычный пост
             message = await self.client.send_message(
                 entity,
                 story_text,
@@ -308,9 +380,6 @@ class TelegramPublisher:
             )
 
             print("✅ Story-пост успешно опубликован!")
-
-            # Опционально: удаляем через 24 часа
-            # Это требует отдельного планировщика задач
 
             return {
                 'status': 'success',
@@ -339,7 +408,6 @@ class TelegramPublisher:
         try:
             print("📸 Публикация личной Story...")
 
-            # Загружаем изображение
             image_file = io.BytesIO(image)
             image_file.name = 'personal_story.png'
             image_file.seek(0)
@@ -347,17 +415,13 @@ class TelegramPublisher:
             uploaded_file = await self.client.upload_file(image_file)
             media = InputMediaUploadedPhoto(file=uploaded_file)
 
-            # Публикуем личную Story
-            from telethon.tl.functions.stories import SendStoryRequest
-            from telethon.tl.types import InputPrivacyValueAllowAll
-
             privacy_rules = [InputPrivacyValueAllowAll()]
 
             result = await self.client(SendStoryRequest(
                 media=media,
                 caption=caption[:200] if len(caption) > 200 else caption,
                 privacy_rules=privacy_rules,
-                period=86400  # 24 часа
+                period=86400
             ))
 
             print("✅ Личная Story опубликована!")
@@ -380,7 +444,7 @@ class TelegramPublisher:
         text: str,
         image: bytes,
         publish_to_story: bool = True,
-        story_type: str = 'channel'  # 'channel', 'personal', или 'both'
+        story_type: str = 'channel'
     ) -> dict:
         """
         Публикация поста в группу и stories
@@ -417,7 +481,6 @@ class TelegramPublisher:
                 entity_title = entity.title if hasattr(entity, 'title') else group_username
                 print(f"✅ Найдено: {entity_title}")
 
-                # Определяем тип чата
                 is_channel = hasattr(entity, 'broadcast') and entity.broadcast
                 is_megagroup = hasattr(entity, 'megagroup') and entity.megagroup
 
@@ -453,7 +516,6 @@ class TelegramPublisher:
             if publish_to_story:
                 story_caption = text[:200] if len(text) > 200 else text
 
-                # Публикуем в Stories канала/группы
                 if story_type in ['channel', 'both']:
                     print(f"\n📸 Публикация Story в {entity_title}...")
                     channel_story_result = await self.publish_to_channel_story(
@@ -471,7 +533,6 @@ class TelegramPublisher:
                     else:
                         print(f"⚠️ {channel_story_result.get('error', 'Неизвестная ошибка')}")
 
-                # Публикуем личную Story
                 if story_type in ['personal', 'both']:
                     print("\n📸 Публикация личной Story...")
                     personal_story_result = await self.publish_personal_story(
@@ -490,31 +551,20 @@ class TelegramPublisher:
             raise Exception(f"Ошибка публикации: {str(e)}")
 
         finally:
-            if self.client and self.client.is_connected():
-                await self.client.disconnect()
-                print("🔌 Отключено от Telegram")
+            # НЕ закрываем соединение - оставляем его открытым для последующих запросов
+            pass
 
     async def check_story_support(self, group_username: str) -> Dict[str, Any]:
-        """
-        Проверка поддержки Stories для группы/канала
-
-        Args:
-            group_username: Username или ID группы/канала
-
-        Returns:
-            Информация о поддержке Stories
-        """
+        """Проверка поддержки Stories для группы/канала"""
         try:
             if not self.client or not self.client.is_connected():
                 await self.connect()
 
-            # Получаем сущность
             if group_username.startswith('@'):
                 group_username = group_username[1:]
 
             entity = await self.client.get_entity(group_username)
 
-            # Проверяем тип и права
             info = {
                 'entity_type': 'unknown',
                 'supports_stories': False,
@@ -524,7 +574,6 @@ class TelegramPublisher:
                 'alternative_method': True
             }
 
-            # Определяем тип
             if hasattr(entity, 'broadcast') and entity.broadcast:
                 info['entity_type'] = 'channel'
             elif hasattr(entity, 'megagroup') and entity.megagroup:
@@ -532,20 +581,16 @@ class TelegramPublisher:
             else:
                 info['entity_type'] = 'group'
 
-            # Проверяем права администратора
             if hasattr(entity, 'admin_rights') and entity.admin_rights:
                 info['is_admin'] = True
 
-                # Проверяем право на Stories
                 if hasattr(entity.admin_rights, 'post_stories'):
                     info['has_story_rights'] = entity.admin_rights.post_stories
 
-            # Для каналов Stories обычно доступны
             if info['entity_type'] == 'channel' and info['is_admin']:
                 info['supports_stories'] = True
-                info['requires_premium'] = True  # Обычно требуется Premium
+                info['requires_premium'] = True
 
-            # Супергруппы могут поддерживать Stories
             elif info['entity_type'] == 'megagroup' and info['is_admin']:
                 info['supports_stories'] = True
                 info['requires_premium'] = True
@@ -559,70 +604,20 @@ class TelegramPublisher:
                 'alternative_method': True
             }
 
-    async def get_groups(self) -> list:
-        """
-        Получение списка доступных групп с информацией о поддержке Stories
-
-        Returns:
-            Список групп
-        """
-        try:
-            if not self.client or not self.client.is_connected():
-                await self.connect()
-
-            dialogs = await self.client.get_dialogs()
-            groups = []
-
-            for dialog in dialogs:
-                if dialog.is_group or dialog.is_channel:
-                    group_info = {
-                        'id': dialog.entity.id,
-                        'title': dialog.title,
-                        'username': getattr(dialog.entity, 'username', None),
-                        'type': 'channel' if getattr(dialog.entity, 'broadcast', False) else 'group',
-                        'is_admin': False,
-                        'supports_stories': False
-                    }
-
-                    # Проверяем права администратора
-                    if hasattr(dialog.entity, 'admin_rights') and dialog.entity.admin_rights:
-                        group_info['is_admin'] = True
-
-                        # Проверяем поддержку Stories
-                        if hasattr(dialog.entity.admin_rights, 'post_stories'):
-                            group_info['supports_stories'] = dialog.entity.admin_rights.post_stories
-
-                    groups.append(group_info)
-
-            return groups
-
-        except Exception as e:
-            raise Exception(f"Ошибка получения групп: {str(e)}")
-
-    async def test_connection(self) -> bool:
-        """
-        Проверка подключения к Telegram
-
-        Returns:
-            True если подключено
-        """
-        try:
-            await self.connect()
-            me = await self.client.get_me()
-
-            # Проверяем Premium статус
-            has_premium = getattr(me, 'premium', False)
-            print(f"👤 Аккаунт: {me.first_name}")
-            print(f"💎 Premium: {'Да' if has_premium else 'Нет'}")
-
-            if not has_premium:
-                print("ℹ️ Для публикации Stories в каналы может потребоваться Telegram Premium")
-
-            return True if me else False
-        except:
-            return False
+    async def disconnect(self):
+        """Закрытие соединения"""
+        if self.client and self.client.is_connected():
+            await self.client.disconnect()
+            print("🔌 Отключено от Telegram")
 
     def __del__(self):
         """Деструктор для закрытия соединения"""
-        if self.client and self.client.is_connected():
-            asyncio.create_task(self.client.disconnect())
+        try:
+            if self.client and self.client.is_connected():
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.client.disconnect())
+                else:
+                    loop.run_until_complete(self.client.disconnect())
+        except:
+            pass

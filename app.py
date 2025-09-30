@@ -15,6 +15,30 @@ from utils.image_processor import ImageProcessor
 from utils.telegram_publisher import TelegramPublisher
 from config import Config
 
+# Глобальное хранилище для publisher'ов
+# Ключ: phone, Значение: publisher instance
+_active_publishers = {}
+_publisher_lock = threading.Lock()
+
+
+def get_publisher(api_id, api_hash, phone):
+    """
+    Получить или создать publisher для данного номера телефона
+    Это гарантирует, что мы используем один и тот же экземпляр
+    """
+    with _publisher_lock:
+        if phone not in _active_publishers:
+            print(f"🆕 Создаем новый publisher для {phone}")
+            _active_publishers[phone] = TelegramPublisher(
+                api_id=str(api_id),
+                api_hash=api_hash,
+                phone=phone
+            )
+        else:
+            print(f"♻️  Используем существующий publisher для {phone}")
+
+        return _active_publishers[phone]
+
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-in-production'
 CORS(app)
@@ -322,6 +346,7 @@ def publish_post():
         print(f"   API ID: {api_id}")
         print(f"   Группа: {config.get('telegram_group')}")
         print(f"   Тип Stories: {story_type}")
+        print(f"   Телефон: {config.get('telegram_phone')}")
 
         # Используем очередь для получения результата из thread
         result_queue = queue.Queue()
@@ -333,8 +358,9 @@ def publish_post():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
-                publisher = TelegramPublisher(
-                    api_id=str(api_id),
+                # КРИТИЧЕСКИ ВАЖНО: Используем общий publisher
+                publisher = get_publisher(
+                    api_id=api_id,
                     api_hash=config.get('telegram_api_hash'),
                     phone=config.get('telegram_phone')
                 )
@@ -471,7 +497,7 @@ def publish_post():
 
 @app.route('/verify_telegram_code', methods=['POST'])
 def verify_telegram_code():
-    """Верификация кода Telegram с улучшенной обработкой"""
+    """Верификация кода Telegram с использованием общего publisher"""
     try:
         data = request.json
         code = data.get('code')
@@ -495,7 +521,8 @@ def verify_telegram_code():
                     'message': 'Telegram API ID должен быть числом. Проверьте конфигурацию.'
                 }), 500
 
-        print(f"🔐 Верификация кода: {code}")
+        phone = config.get('telegram_phone')
+        print(f"🔐 Верификация кода для {phone}: {code}")
 
         # Используем очередь для результата
         result_queue = queue.Queue()
@@ -506,10 +533,11 @@ def verify_telegram_code():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
-                publisher = TelegramPublisher(
-                    api_id=str(api_id),
+                # КРИТИЧЕСКИ ВАЖНО: Используем тот же publisher
+                publisher = get_publisher(
+                    api_id=api_id,
                     api_hash=config.get('telegram_api_hash'),
-                    phone=config.get('telegram_phone')
+                    phone=phone
                 )
 
                 result = loop.run_until_complete(
@@ -534,6 +562,12 @@ def verify_telegram_code():
                     'status': 'error',
                     'message': 'Требуется пароль 2FA. Временно отключите двухфакторную аутентификацию.',
                     'need_2fa': True
+                }), 400
+            elif "неверный код" in str(error).lower() or "запросите новый" in str(error).lower():
+                return jsonify({
+                    'status': 'error',
+                    'message': error,
+                    'need_restart': True  # Сигнал что нужно начать заново
                 }), 400
             else:
                 return jsonify({
@@ -560,6 +594,47 @@ def verify_telegram_code():
     except Exception as e:
         print(f"❌ Критическая ошибка верификации: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# ============================================
+# ДОБАВЬТЕ ENDPOINT ДЛЯ ОЧИСТКИ СЕССИЙ (опционально)
+# ============================================
+
+@app.route('/clear_sessions', methods=['POST'])
+def clear_sessions():
+    """Очистка всех активных сессий и publisher'ов"""
+    try:
+        global _active_publishers
+
+        with _publisher_lock:
+            # Закрываем все активные клиенты
+            for phone, publisher in _active_publishers.items():
+                try:
+                    if publisher.client and publisher.client.is_connected():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(publisher.client.disconnect())
+                        print(f"🔌 Отключен publisher для {phone}")
+                except:
+                    pass
+
+            _active_publishers.clear()
+
+        # Удаляем файл сессий
+        if os.path.exists('telegram_sessions.json'):
+            os.remove('telegram_sessions.json')
+            print("🗑️  Файл сессий удален")
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Все сессии очищены. Требуется повторная авторизация.'
+        })
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 
 @app.route('/check_story_support', methods=['POST'])
@@ -611,50 +686,6 @@ def check_story_support():
                 'note': 'Stories будут опубликованы доступным методом'
             }
         })
-
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/verify_telegram_code', methods=['POST'])
-def verify_telegram_code():
-    """Верификация кода Telegram"""
-    try:
-        data = request.json
-        code = data.get('code')
-
-        config = load_config()
-
-        # Проверяем тип telegram_api_id
-        api_id = config.get('telegram_api_id')
-        if api_id and isinstance(api_id, str):
-            try:
-                api_id = int(api_id)
-            except ValueError:
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Telegram API ID должен быть числом. Проверьте конфигурацию.'
-                }), 500
-
-        def run_async_verify():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            publisher = TelegramPublisher(
-                api_id=str(api_id),  # Publisher сам преобразует в int
-                api_hash=config.get('telegram_api_hash'),
-                phone=config.get('telegram_phone')
-            )
-
-            result = loop.run_until_complete(
-                publisher.verify_code(code)
-            )
-            return result
-
-        thread = threading.Thread(target=run_async_verify)
-        thread.start()
-        thread.join(timeout=10)
-
-        return jsonify({'status': 'success', 'message': 'Код подтвержден'})
 
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
