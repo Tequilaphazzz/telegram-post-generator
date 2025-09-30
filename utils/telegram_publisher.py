@@ -1,623 +1,322 @@
 """
-Модуль для публикации постов в Telegram с поддержкой Stories каналов
-ИСПРАВЛЕНА ОШИБКА: table version already exists
+telegram_publisher_v2.py
+Упрощённый и надёжный модуль для публикации постов и сториз в Telegram с корректной
+логикой авторизации (запрос кода -> подтверждение кода) и управлением сессиями.
+
+Как использовать (пример):
+    tp = TelegramPublisher(api_id, api_hash, phone)
+    await tp.create_client()            # создаёт клиент (не авторизован)
+    sent = await tp.start_login()       # отправляет код на телефон; возвращает True/False
+    # вывести в UI: "Код отправлен" или ошибка
+    await tp.finish_login(code)        # ввод кода из UI — завершает авторизацию
+    await tp.publish_post(...)          # публикует пост и (опционально) сториз
+    await tp.disconnect()
 """
+
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.stories import SendStoryRequest, CanSendStoryRequest
 from telethon.tl.types import InputMediaUploadedPhoto, InputPrivacyValueAllowAll
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    FloodWaitError,
+)
+from typing import Optional, Dict, Any
 import asyncio
 import io
-from typing import Optional, Dict, Any
-import os
 import json
+import os
+import time
+
 
 class TelegramPublisher:
-    """Класс для публикации в Telegram"""
+    """Надёжный публикатор для Telegram (async)."""
 
-    # Глобальное хранилище сессий
-    _session_store_file = 'telegram_sessions.json'
-
-    def __init__(self, api_id: str, api_hash: str, phone: str):
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        phone: str,
+        session_store_file: str = "telegram_sessions.json",
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ):
         """
-        Инициализация публикатора
-
-        Args:
-            api_id: Telegram API ID (будет преобразован в число)
-            api_hash: Telegram API Hash
-            phone: Номер телефона
+        api_id: int (API ID из my.telegram.org)
+        api_hash: str
+        phone: str (с + или без — будет нормализован)
+        session_store_file: путь к JSON, где храним session_string по номеру
+        loop: опциональный event loop (если None, используется текущий)
         """
-        # ВАЖНО: Убедимся что api_id - это число
+        if not isinstance(api_id, int):
+            raise ValueError("api_id должен быть int")
+        if not api_hash or not isinstance(api_hash, str):
+            raise ValueError("api_hash должен быть непустой строкой")
+
+        phone = str(phone).strip()
+        if not phone.startswith("+"):
+            phone = "+" + phone
+
+        self.api_id = api_id
+        self.api_hash = api_hash.strip()
+        self.phone = phone
+        self.session_store_file = session_store_file
+        self.loop = loop or asyncio.get_event_loop()
+
+        self.client: Optional[TelegramClient] = None
+        self.session_string: Optional[str] = self._load_session()
+        # phone_code_hash хранится только в оперативной памяти пока клиент жив; не логируем его
+        self._phone_code_hash: Optional[str] = None
+        self._last_code_sent_at: Optional[float] = None
+
+    # ---------- Сессии ----------
+    def _load_session(self) -> Optional[str]:
+        """Загрузить session_string для self.phone (или None)."""
         try:
-            self.api_id = int(str(api_id).strip())
-        except ValueError:
-            raise Exception(f"API ID должен быть числом, получено: {api_id}")
-
-        self.api_hash = str(api_hash).strip()
-        if not self.api_hash:
-            raise Exception("API Hash не может быть пустым")
-
-        self.phone = str(phone).strip()
-        if not self.phone.startswith('+'):
-            self.phone = '+' + self.phone
-
-        self.client = None
-
-        # Загружаем или создаем string session
-        self.session_string = self._load_session()
-
-        print(f"✅ Telegram Publisher инициализирован:")
-        print(f"   API ID: {self.api_id}")
-        print(f"   Телефон: {self.phone}")
-        print(f"   Сессия: {'Существующая' if self.session_string else 'Новая'}")
-
-    def _load_session(self) -> str:
-        """Загрузка сохраненной сессии"""
-        try:
-            if os.path.exists(self._session_store_file):
-                with open(self._session_store_file, 'r') as f:
-                    sessions = json.load(f)
-                    return sessions.get(self.phone, '')
-            return ''
-        except:
-            return ''
+            if os.path.exists(self.session_store_file):
+                with open(self.session_store_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data.get(self.phone)
+        except Exception:
+            # нечего делать — считаем, что сессии нет
+            pass
+        return None
 
     def _save_session(self, session_string: str):
-        """Сохранение сессии"""
+        """Сохранить session_string под ключом self.phone."""
         try:
-            sessions = {}
-            if os.path.exists(self._session_store_file):
-                with open(self._session_store_file, 'r') as f:
-                    sessions = json.load(f)
-
-            sessions[self.phone] = session_string
-
-            with open(self._session_store_file, 'w') as f:
-                json.dump(sessions, f, indent=2)
-
-            print("💾 Сессия сохранена")
+            data = {}
+            if os.path.exists(self.session_store_file):
+                with open(self.session_store_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            data[self.phone] = session_string
+            with open(self.session_store_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print(f"⚠️ Не удалось сохранить сессию: {e}")
+            # логируем, но не поднимаем исключение
+            print(f"[telegram_publisher] Не удалось сохранить сессию: {e}")
 
-    async def connect(self):
-        """Подключение к Telegram с использованием StringSession"""
+    # ---------- Клиент ----------
+    async def create_client(self) -> TelegramClient:
+        """
+        Создать и подключить TelegramClient (если уже создан - возвращает его).
+        Не выполняет авторизацию.
+        """
+        if self.client and self.client.is_connected():
+            return self.client
+
+        session = StringSession(self.session_string) if self.session_string else StringSession()
+        self.client = TelegramClient(session, self.api_id, self.api_hash)
+        # Подключаемся безопасно
+        await self.client.connect()
+        return self.client
+
+    async def is_authorized(self) -> bool:
+        """Проверка, авторизован ли клиент."""
+        if not self.client:
+            await self.create_client()
         try:
-            # Закрываем старый клиент если есть
-            if self.client and self.client.is_connected():
-                await self.client.disconnect()
-                print("🔌 Старое соединение закрыто")
+            return await self.client.is_user_authorized()
+        except Exception:
+            return False
 
-            print("🔄 Создание нового клиента Telegram...")
+    # ---------- Логин: запрос кода и подтверждение ----------
+    async def start_login(self) -> Dict[str, Any]:
+        """
+        Запрашивает код подтверждения на телефон.
+        Возвращает dict: {'ok': True, 'message': 'Код отправлен'} или {'ok': False, 'error': '...'}
+        Защита от частых повторных запросов: минимум 10 секунд между запросами.
+        """
+        await self.create_client()
 
-            # Используем StringSession вместо SQLite
-            if self.session_string:
-                session = StringSession(self.session_string)
-                print("📂 Использую сохраненную сессию")
-            else:
-                session = StringSession()
-                print("🆕 Создаю новую сессию")
+        # Если уже авторизованы — ничего не делаем
+        if await self.is_authorized():
+            return {"ok": True, "message": "Уже авторизованы"}
 
-            self.client = TelegramClient(
-                session,
-                self.api_id,
-                self.api_hash,
-                connection_retries=5,
-                retry_delay=1,
-                timeout=30
-            )
+        # Защита от частого запроса кода
+        now = time.time()
+        if self._last_code_sent_at and now - self._last_code_sent_at < 10:
+            return {"ok": False, "error": "Запрошено слишком часто, подождите немного."}
 
-            print("🔄 Подключение к Telegram...")
-            await self.client.connect()
+        try:
+            sent = await self.client.send_code_request(self.phone)
+            # sent.phone_code_hash может быть None или строкой — сохраняем в память
+            self._phone_code_hash = getattr(sent, "phone_code_hash", None)
+            self._last_code_sent_at = now
+            return {"ok": True, "message": "Код отправлен"}
+        except FloodWaitError as e:
+            return {"ok": False, "error": f"Flood wait: подождите {e.seconds} сек."}
+        except Exception as e:
+            return {"ok": False, "error": f"Ошибка отправки кода: {e}"}
 
-            # Проверяем авторизацию
-            is_authorized = await self.client.is_user_authorized()
+    async def finish_login(self, code: str) -> Dict[str, Any]:
+        """
+        Подтверждение кода (войти).
+        Возвращает {'ok': True, 'message': 'Авторизация успешна'} или {'ok': False, 'error': '...'}
+        """
+        if not code or not code.strip():
+            return {"ok": False, "error": "Код пустой"}
 
-            if not is_authorized:
-                print("📱 Не авторизован. Отправка кода подтверждения...")
-                try:
-                    # Отправляем запрос на код
-                    await self.client.send_code_request(self.phone)
-                    print("✅ Код отправлен на номер " + self.phone)
-                    print("⏳ Ожидание ввода кода в веб-интерфейсе...")
+        await self.create_client()
 
-                    # Возвращаем False чтобы указать что требуется код
-                    return False
+        if await self.is_authorized():
+            return {"ok": True, "message": "Уже авторизованы"}
 
-                except Exception as e:
-                    error_msg = str(e)
-                    print(f"❌ Ошибка отправки кода: {error_msg}")
+        code_clean = code.strip().replace(" ", "").replace("-", "")
 
-                    # Проверяем тип ошибки
-                    if "flood" in error_msg.lower():
-                        raise Exception("Слишком много попыток. Подождите несколько минут перед повторной попыткой.")
-                    elif "phone_number_invalid" in error_msg.lower():
-                        raise Exception(f"Неверный номер телефона: {self.phone}")
-                    elif "api_id_invalid" in error_msg.lower():
-                        raise Exception("Неверная комбинация API ID/Hash. Проверьте credentials на my.telegram.org")
-                    else:
-                        raise
+        # Если phone_code_hash отсутствует — попросим сначала вызвать start_login
+        if not self._phone_code_hash:
+            return {"ok": False, "error": "Предварительно вызовите start_login() для отправки кода."}
 
-            # Если авторизованы, получаем информацию о пользователе
-            print("✅ Уже авторизован. Получение информации...")
-            me = await self.client.get_me()
-            print(f"👤 Вы вошли как: {me.first_name} {me.last_name or ''}")
+        try:
+            # sign_in: Telethon умеет принимать phone+code+phone_code_hash
+            await self.client.sign_in(phone=self.phone, code=code_clean, phone_code_hash=self._phone_code_hash)
 
-            if hasattr(me, 'username') and me.username:
-                print(f"   Username: @{me.username}")
+        except SessionPasswordNeededError:
+            return {"ok": False, "error": "Требуется пароль двухфакторной аутентификации (2FA)."}
 
-            if hasattr(me, 'premium') and me.premium:
-                print("   💎 Telegram Premium: Да")
+        except PhoneCodeInvalidError:
+            return {"ok": False, "error": "Неверный код. Проверьте код и попробуйте снова."}
 
-            # Сохраняем сессию после успешного подключения
-            if not self.session_string:
-                self.session_string = self.client.session.save()
-                self._save_session(self.session_string)
+        except PhoneCodeExpiredError:
+            # code expired — сброс phone_code_hash и подсказка вызвать start_login заново
+            self._phone_code_hash = None
+            return {"ok": False, "error": "Код истёк. Запросите новый код (start_login())."}
 
-            return True
+        except FloodWaitError as e:
+            return {"ok": False, "error": f"Flood wait: подождите {e.seconds} сек."}
 
         except Exception as e:
-            error_msg = str(e)
-            print(f"❌ Ошибка подключения: {error_msg}")
+            # В редких случаях Telethon возвращает "SESSION_PASSWORD_NEEDED" в разных формах;
+            # тут возвращаем ошибку для дебага
+            return {"ok": False, "error": f"Ошибка входа: {e}"}
 
-            # Детальная диагностика
-            if "api_id" in error_msg.lower() or "api_hash" in error_msg.lower():
-                print("\n⚠️ Проблема с API credentials:")
-                print("1. Проверьте правильность API ID и API Hash")
-                print("2. Убедитесь, что используете credentials от my.telegram.org")
-                print("3. API ID должен быть числом")
-                print(f"\nВаш API ID: {self.api_id} (тип: {type(self.api_id).__name__})")
-            elif "phone" in error_msg.lower():
-                print(f"\n⚠️ Проблема с номером телефона: {self.phone}")
-                print("Номер должен быть в формате: +7XXXXXXXXXX")
-
-            raise
-
-    async def verify_code(self, code: str):
-        """
-        Верификация кода подтверждения
-
-        Args:
-            code: Код из Telegram
-        """
+        # Если дошли сюда — успешный вход
+        # Сохраняем session_string
         try:
-            # Проверяем наличие клиента
-            if not self.client:
-                print("⚠️ Клиент не инициализирован, создаем новый...")
-                await self.connect()
-
-            # Проверяем подключение
-            if not self.client.is_connected():
-                print("⚠️ Клиент не подключен, подключаемся...")
-                await self.client.connect()
-
-            print(f"🔐 Попытка входа с кодом: {code}")
-
-            # Очищаем код от пробелов и дефисов
-            code = code.strip().replace(' ', '').replace('-', '')
-
-            if len(code) != 5:
-                raise Exception(f"Код должен содержать 5 цифр, получено: {len(code)} символов")
-
-            # Пробуем войти с кодом
-            await self.client.sign_in(self.phone, code)
-
-            print("✅ Код подтвержден успешно")
-
-            # Получаем информацию о пользователе для подтверждения
-            me = await self.client.get_me()
-            print(f"👤 Авторизован как: {me.first_name}")
-
-            # ВАЖНО: Сохраняем новую сессию после успешной авторизации
             self.session_string = self.client.session.save()
             self._save_session(self.session_string)
-            print("💾 Новая сессия сохранена")
+        except Exception:
+            # сохранять не удалось — но всё равно считаем, что вошли
+            pass
 
-            return True
+        # чистим phone_code_hash (он больше не нужен)
+        self._phone_code_hash = None
+        return {"ok": True, "message": "Авторизация успешна"}
 
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ Ошибка верификации: {error_msg}")
-
-            # Детальные сообщения об ошибках
-            if "password" in error_msg.lower() or "2fa" in error_msg.lower():
-                print("⚠️ Требуется пароль двухфакторной аутентификации")
-                raise Exception("Требуется 2FA пароль. Временно отключите 2FA в настройках Telegram и попробуйте снова.")
-            elif "phone_code_invalid" in error_msg.lower():
-                raise Exception("Неверный код. Проверьте код из Telegram и попробуйте снова. Код должен состоять из 5 цифр.")
-            elif "phone_code_expired" in error_msg.lower():
-                raise Exception("Код истек. Запросите новый код и попробуйте снова.")
-            elif "phone_code_empty" in error_msg.lower():
-                raise Exception("Код не может быть пустым.")
-            elif "session_revoked" in error_msg.lower():
-                # Удаляем поврежденную сессию
-                self.session_string = ''
-                self._save_session('')
-                raise Exception("Сессия отозвана. Попробуйте авторизоваться заново.")
-
-            raise Exception(f"Ошибка верификации: {error_msg}")
-
-    async def publish_to_channel_story(self, channel_entity, image: bytes, caption: str) -> Dict[str, Any]:
-        """
-        Публикация Story в канал/группу
-
-        Args:
-            channel_entity: Сущность канала/группы
-            image: Изображение в байтах
-            caption: Подпись к истории
-
-        Returns:
-            Результат публикации
-        """
-        try:
-            print(f"📸 Попытка публикации Story в канал/группу...")
-
-            # Проверяем права администратора
-            try:
-                chat_entity = await self.client.get_entity(channel_entity)
-
-                if hasattr(chat_entity, 'admin_rights') and chat_entity.admin_rights:
-                    print("✅ Права администратора подтверждены")
-
-                    if hasattr(chat_entity.admin_rights, 'post_stories') and not chat_entity.admin_rights.post_stories:
-                        print("❌ У вас нет прав на публикацию Stories в этом канале")
-                        return {
-                            'status': 'error',
-                            'error': 'Нет прав на публикацию Stories. Проверьте права администратора.'
-                        }
-                else:
-                    try:
-                        me = await self.client.get_me()
-                        participant = await self.client.get_permissions(channel_entity, me)
-
-                        if not participant.is_admin:
-                            print("⚠️ Вы не администратор в этой группе")
-                    except:
-                        print("⚠️ Не удалось проверить права администратора")
-            except Exception as e:
-                print(f"⚠️ Не удалось проверить права: {e}")
-
-            # Загружаем изображение
-            image_file = io.BytesIO(image)
-            image_file.name = 'story_image.png'
-            image_file.seek(0)
-
-            print("📤 Загрузка изображения...")
-            uploaded_file = await self.client.upload_file(image_file)
-
-            media = InputMediaUploadedPhoto(file=uploaded_file)
-
-            # Проверяем возможность отправки Story
-            try:
-                can_send = await self.client(CanSendStoryRequest(
-                    peer=channel_entity
-                ))
-
-                if not can_send:
-                    print("❌ Не можем отправить Story в этот чат")
-                    print("🔄 Пробуем альтернативный метод...")
-                    return await self._publish_as_story_post(channel_entity, image, caption)
-            except Exception as e:
-                print(f"⚠️ CanSendStoryRequest не поддерживается: {e}")
-
-            privacy_rules = [InputPrivacyValueAllowAll()]
-
-            if len(caption) > 200:
-                caption = caption[:197] + "..."
-
-            print("📤 Отправка Story в канал...")
-            result = await self.client(SendStoryRequest(
-                peer=channel_entity,
-                media=media,
-                caption=caption,
-                privacy_rules=privacy_rules,
-                pinned=False,
-                noforwards=False,
-                period=86400
-            ))
-
-            print("✅ Story успешно опубликована в канале!")
-
-            return {
-                'status': 'success',
-                'story_id': result.updates[0].id if hasattr(result, 'updates') and result.updates else None,
-                'type': 'channel_story'
-            }
-
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ Ошибка публикации Story в канал: {error_msg}")
-
-            if "STORIES_TOO_MUCH" in error_msg:
-                return {
-                    'status': 'error',
-                    'error': 'Достигнут лимит Stories. Подождите перед публикацией новой.'
-                }
-            elif "PREMIUM_ACCOUNT_REQUIRED" in error_msg:
-                return {
-                    'status': 'error',
-                    'error': 'Для публикации Stories в канал требуется Telegram Premium.'
-                }
-            elif "CHAT_ADMIN_REQUIRED" in error_msg:
-                return {
-                    'status': 'error',
-                    'error': 'Требуются права администратора для публикации Stories.'
-                }
-            elif "PEER_ID_INVALID" in error_msg:
-                print("🔄 Пробуем альтернативный метод публикации...")
-                return await self._publish_as_story_post(channel_entity, image, caption)
-            else:
-                return {
-                    'status': 'error',
-                    'error': error_msg
-                }
-
-    async def _publish_as_story_post(self, entity, image: bytes, caption: str) -> Dict[str, Any]:
-        """
-        Альтернативный метод: публикация как пост с особым форматированием
-
-        Args:
-            entity: Сущность канала/группы
-            image: Изображение
-            caption: Подпись
-
-        Returns:
-            Результат публикации
-        """
-        try:
-            print("📱 Публикация как Story-подобный пост...")
-
-            story_text = f"📸 **STORY** 📸\n\n{caption}\n\n⏰ _Доступно 24 часа_\n\n#story #{entity.username if hasattr(entity, 'username') and entity.username else 'story'}"
-
-            image_file = io.BytesIO(image)
-            image_file.name = 'story_post.png'
-            image_file.seek(0)
-
-            message = await self.client.send_message(
-                entity,
-                story_text,
-                file=image_file,
-                parse_mode='Markdown'
-            )
-
-            print("✅ Story-пост успешно опубликован!")
-
-            return {
-                'status': 'success',
-                'message_id': message.id,
-                'type': 'story_post',
-                'note': 'Опубликовано как пост в стиле Story'
-            }
-
-        except Exception as e:
-            return {
-                'status': 'error',
-                'error': f'Не удалось опубликовать Story-пост: {str(e)}'
-            }
-
-    async def publish_personal_story(self, image: bytes, caption: str) -> Dict[str, Any]:
-        """
-        Публикация личной Story
-
-        Args:
-            image: Изображение в байтах
-            caption: Подпись к истории
-
-        Returns:
-            Результат публикации
-        """
-        try:
-            print("📸 Публикация личной Story...")
-
-            image_file = io.BytesIO(image)
-            image_file.name = 'personal_story.png'
-            image_file.seek(0)
-
-            uploaded_file = await self.client.upload_file(image_file)
-            media = InputMediaUploadedPhoto(file=uploaded_file)
-
-            privacy_rules = [InputPrivacyValueAllowAll()]
-
-            result = await self.client(SendStoryRequest(
-                media=media,
-                caption=caption[:200] if len(caption) > 200 else caption,
-                privacy_rules=privacy_rules,
-                period=86400
-            ))
-
-            print("✅ Личная Story опубликована!")
-
-            return {
-                'status': 'success',
-                'story_id': result.updates[0].id if hasattr(result, 'updates') and result.updates else None,
-                'type': 'personal_story'
-            }
-
-        except Exception as e:
-            return {
-                'status': 'error',
-                'error': f'Ошибка публикации личной Story: {str(e)}'
-            }
-
+    # ---------- Публикация ----------
     async def publish_post(
         self,
         group_username: str,
         text: str,
-        image: bytes,
+        image_bytes: Optional[bytes] = None,
         publish_to_story: bool = True,
-        story_type: str = 'channel'
-    ) -> dict:
+        story_type: str = "channel",
+    ) -> Dict[str, Any]:
         """
-        Публикация поста в группу и stories
-
-        Args:
-            group_username: Username или ID группы
-            text: Текст поста
-            image: Изображение в байтах
-            publish_to_story: Публиковать ли в stories
-            story_type: Тип Story ('channel', 'personal', или 'both')
-
-        Returns:
-            Результат публикации
+        Публикация в канал/группу и опционально — сториз.
+        group_username: юзернейм или id чата; можно с ведущим @.
+        Возвращает подробный словарь с результатами или ошибкой.
         """
+        await self.create_client()
+
+        if not await self.is_authorized():
+            return {"ok": False, "error": "Не авторизованы. Выполните start_login() и finish_login(code)."}
+
+        # нормализуем username
+        uname = str(group_username).strip()
+        if uname.startswith("@"):
+            uname = uname[1:]
+
         try:
-            # Подключаемся если еще не подключены
-            if not self.client or not self.client.is_connected():
-                connected = await self.connect()
-                if not connected:
-                    raise Exception("Требуется верификация. Отправьте код подтверждения.")
-
-            # Загружаем изображение для поста
-            image_file = io.BytesIO(image)
-            image_file.name = 'post_image.png'
-            image_file.seek(0)
-
-            # Получаем группу/канал
-            print(f"🔍 Поиск группы/канала: {group_username}")
             try:
-                if group_username.startswith('@'):
-                    group_username = group_username[1:]
+                entity = await self.client.get_entity(uname)
+            except Exception:
+                # если username — это число
+                entity = await self.client.get_entity(int(uname))
 
-                entity = await self.client.get_entity(group_username)
-                entity_title = entity.title if hasattr(entity, 'title') else group_username
-                print(f"✅ Найдено: {entity_title}")
-
-                is_channel = hasattr(entity, 'broadcast') and entity.broadcast
-                is_megagroup = hasattr(entity, 'megagroup') and entity.megagroup
-
-                print(f"   Тип: {'Канал' if is_channel else 'Супергруппа' if is_megagroup else 'Группа'}")
-
-            except:
-                try:
-                    entity = await self.client.get_entity(int(group_username))
-                    entity_title = entity.title if hasattr(entity, 'title') else group_username
-                    print(f"✅ Найдено по ID: {entity_title}")
-                except:
-                    raise Exception(f"Не удалось найти группу/канал: {group_username}")
-
-            # Публикуем пост в группу
-            print("📤 Отправка поста в группу/канал...")
-            message = await self.client.send_message(
-                entity,
-                text,
-                file=image_file
-            )
-            print(f"✅ Пост опубликован! ID: {message.id}")
+            # отправка поста
+            msg = None
+            if image_bytes:
+                bio = io.BytesIO(image_bytes)
+                bio.name = "image.png"
+                bio.seek(0)
+                msg = await self.client.send_file(entity, bio, caption=text)
+            else:
+                msg = await self.client.send_message(entity, text)
 
             result = {
-                'group_post': {
-                    'status': 'success',
-                    'message_id': message.id,
-                    'chat_id': entity.id,
-                    'chat_title': entity_title
-                }
+                "ok": True,
+                "group_post": {
+                    "message_id": getattr(msg, "id", None),
+                    "chat_id": getattr(entity, "id", None),
+                    "chat_title": getattr(entity, "title", uname),
+                },
             }
 
-            # Публикуем в Stories если нужно
-            if publish_to_story:
-                story_caption = text[:200] if len(text) > 200 else text
+            # Stories (опционально)
+            if publish_to_story and story_type in ("channel", "both", "personal"):
+                story_caption = text if len(text) <= 200 else text[:197] + "..."
+                if story_type in ("channel", "both"):
+                    # попытаемся отправить story в канал
+                    try:
+                        cs = await self._publish_to_channel_story(entity, image_bytes, story_caption)
+                        result["channel_story"] = cs
+                    except Exception as e:
+                        result["channel_story"] = {"ok": False, "error": str(e)}
 
-                if story_type in ['channel', 'both']:
-                    print(f"\n📸 Публикация Story в {entity_title}...")
-                    channel_story_result = await self.publish_to_channel_story(
-                        entity,
-                        image,
-                        story_caption
-                    )
-                    result['channel_story'] = channel_story_result
-
-                    if channel_story_result['status'] == 'success':
-                        if channel_story_result.get('type') == 'story_post':
-                            print("ℹ️ Story опубликована как специальный пост")
-                        else:
-                            print("✅ Story успешно опубликована в канале!")
-                    else:
-                        print(f"⚠️ {channel_story_result.get('error', 'Неизвестная ошибка')}")
-
-                if story_type in ['personal', 'both']:
-                    print("\n📸 Публикация личной Story...")
-                    personal_story_result = await self.publish_personal_story(
-                        image,
-                        story_caption
-                    )
-                    result['personal_story'] = personal_story_result
-
-                    if personal_story_result['status'] == 'success':
-                        print("✅ Личная Story опубликована!")
+                if story_type in ("personal", "both"):
+                    try:
+                        ps = await self._publish_personal_story(image_bytes, story_caption)
+                        result["personal_story"] = ps
+                    except Exception as e:
+                        result["personal_story"] = {"ok": False, "error": str(e)}
 
             return result
 
         except Exception as e:
-            print(f"❌ Ошибка публикации: {str(e)}")
-            raise Exception(f"Ошибка публикации: {str(e)}")
+            return {"ok": False, "error": f"Ошибка публикации: {e}"}
 
-        finally:
-            # НЕ закрываем соединение - оставляем его открытым для последующих запросов
-            pass
+    async def _publish_to_channel_story(self, entity, image_bytes: bytes, caption: str) -> Dict[str, Any]:
+        """Публикует story в указанный канал (entity)."""
+        if not image_bytes:
+            raise ValueError("Для сториз требуется изображение (image_bytes).")
 
-    async def check_story_support(self, group_username: str) -> Dict[str, Any]:
-        """Проверка поддержки Stories для группы/канала"""
+        bio = io.BytesIO(image_bytes)
+        bio.name = "story.png"
+        bio.seek(0)
+        uploaded = await self.client.upload_file(bio)
+        media = InputMediaUploadedPhoto(file=uploaded)
+        privacy = [InputPrivacyValueAllowAll()]
+
+        # SendStoryRequest может требовать права/премиум — ловим ошибки
         try:
-            if not self.client or not self.client.is_connected():
-                await self.connect()
-
-            if group_username.startswith('@'):
-                group_username = group_username[1:]
-
-            entity = await self.client.get_entity(group_username)
-
-            info = {
-                'entity_type': 'unknown',
-                'supports_stories': False,
-                'is_admin': False,
-                'has_story_rights': False,
-                'requires_premium': False,
-                'alternative_method': True
-            }
-
-            if hasattr(entity, 'broadcast') and entity.broadcast:
-                info['entity_type'] = 'channel'
-            elif hasattr(entity, 'megagroup') and entity.megagroup:
-                info['entity_type'] = 'megagroup'
-            else:
-                info['entity_type'] = 'group'
-
-            if hasattr(entity, 'admin_rights') and entity.admin_rights:
-                info['is_admin'] = True
-
-                if hasattr(entity.admin_rights, 'post_stories'):
-                    info['has_story_rights'] = entity.admin_rights.post_stories
-
-            if info['entity_type'] == 'channel' and info['is_admin']:
-                info['supports_stories'] = True
-                info['requires_premium'] = True
-
-            elif info['entity_type'] == 'megagroup' and info['is_admin']:
-                info['supports_stories'] = True
-                info['requires_premium'] = True
-
-            return info
-
+            res = await self.client(SendStoryRequest(peer=entity, media=media, caption=caption, privacy_rules=privacy, pinned=False, noforwards=False, period=86400))
+            return {"ok": True, "info": getattr(res, "updates", None)}
         except Exception as e:
-            return {
-                'error': str(e),
-                'supports_stories': False,
-                'alternative_method': True
-            }
+            # если не получилось — пробуем fallback: отправить сообщение с пометкой "STORY"
+            # но не используем recursion — просто возвращаем ошибку и позволяем вызывающему принять решение
+            raise
 
+    async def _publish_personal_story(self, image_bytes: bytes, caption: str) -> Dict[str, Any]:
+        """Публикация личной сториз (в профиль)."""
+        if not image_bytes:
+            raise ValueError("Для личной сториз требуется изображение (image_bytes).")
+
+        bio = io.BytesIO(image_bytes)
+        bio.name = "personal_story.png"
+        bio.seek(0)
+        uploaded = await self.client.upload_file(bio)
+        media = InputMediaUploadedPhoto(file=uploaded)
+        privacy = [InputPrivacyValueAllowAll()]
+
+        res = await self.client(SendStoryRequest(media=media, caption=caption, privacy_rules=privacy, period=86400))
+        return {"ok": True, "info": getattr(res, "updates", None)}
+
+    # ---------- Отключение ----------
     async def disconnect(self):
-        """Закрытие соединения"""
+        """Отключить клиент (если подключён)."""
         if self.client and self.client.is_connected():
             await self.client.disconnect()
-            print("🔌 Отключено от Telegram")
-
-    def __del__(self):
-        """Деструктор для закрытия соединения"""
-        try:
-            if self.client and self.client.is_connected():
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(self.client.disconnect())
-                else:
-                    loop.run_until_complete(self.client.disconnect())
-        except:
-            pass
+            self.client = None
