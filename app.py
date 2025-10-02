@@ -13,8 +13,6 @@ from werkzeug.exceptions import BadRequest
 
 # Импортируем наши модули
 from telegram_manager import TelegramManager
-from image_generator import ImageGenerator  # Ваш существующий модуль
-from chatgpt_generator import ChatGPTGenerator  # Ваш существующий модуль
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-here'

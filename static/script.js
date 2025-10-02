@@ -13,7 +13,7 @@ document.addEventListener('DOMContentLoaded', function() {
 // Загрузка сохраненной конфигурации
 async function loadConfig() {
     try {
-        const response = await fetch('/get_config');
+        const response = await fetch('/get_configuration');
         const data = await response.json();
         
         if (data.status === 'success' && data.config) {
