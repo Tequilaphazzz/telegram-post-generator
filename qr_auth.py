@@ -1,14 +1,18 @@
 """
-Скрипт авторизации через QR-код
-Этот метод ОБХОДИТ флуд-бан на отправку SMS кодов!
+Скрипт QR-авторизации для обхода флуд-бана на SMS
+Работает с обновленным utils/telegram_publisher.py
 """
 import asyncio
-from telethon import TelegramClient
-from telethon.sessions import StringSession
 import json
 import os
+import sys
 
-# ВАШИ ДАННЫЕ (берем из config.json)
+# Добавляем путь к модулям
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from utils.telegram_publisher import TelegramPublisher
+
+
 def load_config():
     """Загрузка конфигурации из config.json"""
     if os.path.exists('config.json'):
@@ -16,177 +20,288 @@ def load_config():
             return json.load(f)
     return {}
 
-config = load_config()
-
-API_ID = config.get('telegram_api_id')
-API_HASH = config.get('telegram_api_hash')
-PHONE = config.get('telegram_phone')
-
-print("=" * 60)
-print("🔐 АВТОРИЗАЦИЯ TELEGRAM ЧЕРЕЗ QR-КОД")
-print("=" * 60)
-print(f"\n📱 Телефон: {PHONE}")
-print(f"🔑 API ID: {API_ID}")
-print("=" * 60)
-
 
 async def qr_login():
-    """Авторизация через QR-код"""
+    """QR-авторизация через обновленный TelegramPublisher"""
+
+    # Загружаем конфигурацию
+    config = load_config()
+
+    api_id = config.get('telegram_api_id')
+    api_hash = config.get('telegram_api_hash')
+    phone = config.get('telegram_phone')
+
+    print("=" * 60)
+    print("🔐 QR-АВТОРИЗАЦИЯ TELEGRAM")
+    print("=" * 60)
+    print(f"\n📱 Телефон: {phone}")
+    print(f"🔑 API ID: {api_id}")
+    print("=" * 60)
 
     # Проверяем данные
-    if not API_ID or not API_HASH:
+    if not api_id or not api_hash:
         print("\n❌ ОШИБКА: Не найдены API_ID или API_HASH в config.json")
         print("Убедитесь что вы сохранили настройки в веб-интерфейсе")
         return False
 
     print("\n🔄 Инициализация клиента...")
 
-    # Создаем клиента с пустой StringSession
-    client = TelegramClient(
-        StringSession(),
-        int(API_ID),
-        API_HASH,
-        connection_retries=5
+    # Создаем publisher
+    publisher = TelegramPublisher(
+        api_id=str(api_id),
+        api_hash=api_hash,
+        phone=phone
     )
 
-    await client.connect()
+    # Подключаемся
+    connected = await publisher.connect()
 
-    # Проверяем авторизацию
-    if await client.is_user_authorized():
-        print("✅ Уже авторизован!")
-        me = await client.get_me()
-        print(f"👤 Пользователь: {me.first_name} {me.last_name or ''}")
-        print(f"📱 Телефон: {me.phone}")
+    if connected:
+        print("\n✅ Уже авторизован!")
+        me = await publisher.get_me()
+        if me:
+            print(f"👤 Пользователь: {me.first_name} {me.last_name or ''}")
+            print(f"📱 Телефон: {me.phone}")
 
-        # Сохраняем сессию
-        session_string = client.session.save()
-        save_session(me.phone, session_string)
+        # Предлагаем тест
+        choice = input("\n🎯 Хотите протестировать публикацию Stories? (y/n): ").lower()
+        if choice == 'y':
+            await test_story_publication(publisher)
 
-        await client.disconnect()
+        await publisher.disconnect()
         return True
 
-    # Запрашиваем QR-код
-    print("\n🔄 Генерация QR-кода для авторизации...")
+    # Если не авторизован, publisher уже показал QR-код
+    # Теперь нужно подождать сканирования
+
+    print("\n📱 ИНСТРУКЦИЯ:")
+    print("=" * 60)
+    print("1. Откройте Telegram на телефоне")
+    print("2. Перейдите: Настройки → Устройства → Подключить устройство")
+    print("3. Отсканируйте QR-код по ссылке выше")
+    print("4. Подтвердите вход")
     print("=" * 60)
 
+    # Пытаемся использовать библиотеку qrcode для отображения
     try:
-        qr_login_obj = await client.qr_login()
-
-        # Пытаемся использовать библиотеку qrcode
-        try:
+        if hasattr(publisher, '_qr_login') and publisher._qr_login:
             import qrcode
 
-            print("\n📱 ИНСТРУКЦИЯ:")
-            print("=" * 60)
-            print("1. Откройте Telegram на телефоне")
-            print("2. Перейдите: Настройки → Устройства → Подключить устройство")
-            print("3. Отсканируйте QR-код ниже:")
-            print("=" * 60)
-            print()
-
-            # Генерируем и отображаем QR-код
             qr = qrcode.QRCode(
                 version=1,
                 error_correction=qrcode.constants.ERROR_CORRECT_L,
                 box_size=10,
                 border=4,
             )
-            qr.add_data(qr_login_obj.url)
+            qr.add_data(publisher._qr_login.url)
             qr.make(fit=True)
 
-            # Выводим QR в консоль (ASCII)
+            print("\nQR-КОД:")
             qr.print_ascii(invert=True)
+    except ImportError:
+        print("\n⚠️ Установите qrcode для отображения QR в терминале:")
+        print("pip install qrcode[pil]")
 
-        except ImportError:
-            print("\n⚠️ Библиотека qrcode не установлена")
-            print("Установите: pip install qrcode[pil]")
-            print("\nИли откройте эту ссылку на телефоне:")
-            print(qr_login_obj.url)
+    print("\n⏳ Ожидание сканирования (60 секунд)...")
+    print("💡 Если не успеете, запустите скрипт заново")
 
-        print("\n⏳ Ожидание сканирования QR-кода... (60 секунд)")
-        print("💡 Если не успеете, запустите скрипт заново")
-        print()
+    # Ждем авторизацию
+    try:
+        start_time = asyncio.get_event_loop().time()
+        timeout = 60
 
-        # Ждем авторизацию (60 секунд)
-        await asyncio.wait_for(qr_login_obj.wait(), timeout=60)
+        while asyncio.get_event_loop().time() - start_time < timeout:
+            # Проверяем авторизацию
+            if await publisher.client.is_user_authorized():
+                print("\n✅ QR-код отсканирован!")
 
-        print("\n✅ QR-код отсканирован!")
+                # Получаем информацию о пользователе
+                me = await publisher.get_me()
+                if me:
+                    print(f"👤 Авторизован как: {me.first_name} {me.last_name or ''}")
+                    print(f"📱 Телефон: {me.phone}")
 
-        # Получаем информацию о пользователе
-        me = await client.get_me()
-        print(f"👤 Авторизован как: {me.first_name} {me.last_name or ''}")
-        print(f"📱 Телефон: {me.phone}")
+                # Сохраняем сессию
+                session_string = publisher.client.session.save()
+                publisher._save_session(session_string)
 
-        # Сохраняем сессию
-        session_string = client.session.save()
-        save_session(me.phone, session_string)
+                print("\n💾 Сессия сохранена!")
+                print("✅ Теперь можете использовать приложение!")
 
-        print("\n💾 Сессия сохранена в telegram_sessions.json!")
-        print("✅ Теперь можете использовать приложение!")
-        print("\n📌 Следующие шаги:")
-        print("1. Закройте этот скрипт")
-        print("2. Запустите приложение: python app.py")
-        print("3. Попробуйте опубликовать пост (код больше не потребуется)")
+                # Предлагаем тест
+                choice = input("\n🎯 Хотите протестировать публикацию Stories? (y/n): ").lower()
+                if choice == 'y':
+                    await test_story_publication(publisher)
 
-        await client.disconnect()
-        return True
+                await publisher.disconnect()
+                return True
 
-    except asyncio.TimeoutError:
-        print("\n❌ Время истекло. QR-код не был отсканирован.")
+            # Ждем 2 секунды перед следующей проверкой
+            await asyncio.sleep(2)
+            remaining = int(timeout - (asyncio.get_event_loop().time() - start_time))
+            print(f"\r⏳ Ожидание... (осталось {remaining} сек)", end='', flush=True)
+
+        print("\n\n❌ Время истекло. QR-код не был отсканирован.")
         print("💡 Запустите скрипт заново и отсканируйте быстрее")
-        await client.disconnect()
-        return False
 
     except Exception as e:
         print(f"\n❌ Ошибка: {e}")
-        await client.disconnect()
-        return False
+
+    finally:
+        await publisher.disconnect()
+
+    return False
 
 
-def save_session(phone: str, session_string: str):
-    """Сохранение сессии в файл"""
-    session_file = 'telegram_sessions.json'
+async def test_story_publication(publisher):
+    """Тестирование публикации Stories"""
+    print("\n" + "=" * 60)
+    print("📸 ТЕСТ ПУБЛИКАЦИИ STORIES")
+    print("=" * 60)
+
+    # Создаем тестовое изображение
+    print("\n🎨 Создание тестового изображения...")
 
     try:
-        sessions = {}
-        if os.path.exists(session_file):
-            try:
-                with open(session_file, 'r') as f:
-                    sessions = json.load(f)
-            except:
-                sessions = {}
+        from PIL import Image, ImageDraw, ImageFont
+        import io
 
-        sessions[phone] = session_string
+        # Создаем изображение 9:16 (1080x1920)
+        img = Image.new('RGB', (1080, 1920), color='#667eea')
+        draw = ImageDraw.Draw(img)
 
-        with open(session_file, 'w') as f:
-            json.dump(sessions, f, indent=2)
+        # Добавляем текст
+        text = "Тест Stories"
 
-        print(f"💾 Сессия сохранена для: {phone}")
+        # Пробуем загрузить шрифт
+        try:
+            font = ImageFont.truetype("arial.ttf", 100)
+        except:
+            font = ImageFont.load_default()
+
+        # Центрируем текст
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        x = (1080 - text_width) // 2
+        y = (1920 - text_height) // 2
+
+        # Рисуем текст с обводкой
+        for adj in range(-3, 4):
+            for adj2 in range(-3, 4):
+                if adj != 0 or adj2 != 0:
+                    draw.text((x+adj, y+adj2), text, font=font, fill='black')
+        draw.text((x, y), text, font=font, fill='white')
+
+        # Добавляем время
+        from datetime import datetime
+        time_text = datetime.now().strftime("%H:%M:%S")
+        draw.text((50, 1850), time_text, font=font, fill='white')
+
+        # Конвертируем в байты
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='JPEG', quality=95)
+        img_bytes.seek(0)
+        image_data = img_bytes.read()
+
+        print("✅ Изображение создано")
+
+    except ImportError:
+        print("❌ Установите Pillow для создания изображений:")
+        print("pip install Pillow")
+        return
+    except Exception as e:
+        print(f"❌ Ошибка создания изображения: {e}")
+        return
+
+    # Выбор типа Story
+    print("\n📸 Выберите тип Story:")
+    print("1. Личная Story")
+    print("2. Story в канал/группу")
+    print("3. Обе")
+
+    choice = input("\nВаш выбор (1/2/3): ").strip()
+
+    story_type = 'personal'
+    if choice == '2':
+        story_type = 'channel'
+    elif choice == '3':
+        story_type = 'both'
+
+    # Если нужна Story в канал
+    group_username = None
+    if story_type in ('channel', 'both'):
+        config = load_config()
+        group_username = config.get('telegram_group')
+        if not group_username:
+            group_username = input("\n📢 Введите username канала/группы (с @ или без): ").strip()
+
+    # Публикуем
+    print("\n📤 Публикация...")
+
+    try:
+        if story_type == 'personal':
+            # Только личная Story
+            result = await publisher._publish_personal_story(
+                image_data,
+                "🚀 Тестовая Story от бота"
+            )
+            print(f"\n✅ Результат: {result}")
+
+        elif story_type == 'channel' and group_username:
+            # Story в канал
+            entity = await publisher.client.get_entity(group_username)
+            result = await publisher._publish_channel_story(
+                entity,
+                image_data,
+                "📸 Тестовая Story в канал"
+            )
+            print(f"\n✅ Результат: {result}")
+
+        elif story_type == 'both' and group_username:
+            # Обе Stories
+            results = await publisher.publish_post(
+                group_username=group_username,
+                text="🔧 Тестовая публикация с Stories",
+                image=image_data,
+                publish_to_story=True,
+                story_type='both'
+            )
+
+            print("\n✅ Результаты:")
+            for key, value in results.items():
+                print(f"   {key}: {value}")
+
+        print("\n📱 Проверьте Telegram!")
 
     except Exception as e:
-        print(f"⚠️ Ошибка сохранения: {e}")
+        print(f"\n❌ Ошибка публикации: {e}")
 
 
 if __name__ == '__main__':
+    print("🚀 СКРИПТ QR-АВТОРИЗАЦИИ")
+    print("Этот метод обходит флуд-бан на SMS-коды\n")
+
     # Проверяем наличие библиотеки qrcode
     try:
         import qrcode
         print("✅ Библиотека qrcode установлена")
     except ImportError:
-        print("\n⚠️ Библиотека qrcode не установлена")
+        print("⚠️ Библиотека qrcode не установлена")
         print("Рекомендуется установить для отображения QR-кода:")
-        print("pip install qrcode[pil]")
-        print("\nМожно продолжить и без нее (будет ссылка)\n")
+        print("pip install qrcode[pil]\n")
 
     # Проверяем конфигурацию
-    if not API_ID or not API_HASH:
-        print("\n❌ КРИТИЧЕСКАЯ ОШИБКА:")
+    config = load_config()
+    if not config.get('telegram_api_id') or not config.get('telegram_api_hash'):
+        print("❌ КРИТИЧЕСКАЯ ОШИБКА:")
         print("Не найдены API_ID или API_HASH")
         print("\nЧто делать:")
-        print("1. Откройте веб-интерфейс: http://localhost:5000")
+        print("1. Запустите веб-интерфейс: python app.py")
         print("2. Заполните и сохраните настройки API")
         print("3. Запустите этот скрипт снова")
-        exit(1)
+        sys.exit(1)
 
     print("\n🚀 Начинаем авторизацию...")
     print("Нажмите Ctrl+C для отмены\n")

@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Авторизация Telegram</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+        }
+
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 28px;
+        }
+
+        .status-box {
+            background: #f5f5f5;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .status-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .status-label {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .status-value {
+            font-weight: bold;
+        }
+
+        .status-value.success {
+            color: #4CAF50;
+        }
+
+        .status-value.error {
+            color: #f44336;
+        }
+
+        .qr-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 30px 0;
+        }
+
+        #qr-code {
+            width: 280px;
+            height: 280px;
+            border: 4px solid #667eea;
+            border-radius: 15px;
+            padding: 10px;
+            background: white;
+            margin-bottom: 20px;
+        }
+
+        #qr-code img {
+            width: 100%;
+            height: 100%;
+        }
+
+        .qr-loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .instructions {
+            background: #e8f4fd;
+            border-left: 4px solid #2196F3;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+        }
+
+        .instructions h3 {
+            color: #1976D2;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .instructions ol {
+            margin-left: 20px;
+            color: #555;
+            line-height: 1.6;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 12px 30px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 25px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        .btn:hover {
+            background: #5a67d8;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+
+        .btn-danger {
+            background: #f44336;
+        }
+
+        .btn-danger:hover {
+            background: #da190b;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin-top: 20px;
+        }
+
+        .success-message {
+            background: #4CAF50;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .error-message {
+            background: #f44336;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .user-info {
+            background: #f0f8ff;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .user-info h3 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+
+        .user-info-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        .user-info-item:last-child {
+            border-bottom: none;
+            margin-bottom: 0;
+        }
+
+        .user-info-label {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .user-info-value {
+            font-weight: 500;
+            color: #333;
+        }
+
+        .countdown {
+            text-align: center;
+            color: #666;
+            margin-top: 10px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Авторизация Telegram</h1>
+
+        <div class="status-box">
+            <div class="status-item">
+                <span class="status-label">Статус конфигурации:</span>
+                <span class="status-value success">✅ Настроено</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">Статус авторизации:</span>
+                <span id="auth-status" class="status-value">
+                    ⏳ Проверка...
+                </span>
+            </div>
+        </div>
+
+        <div id="content">
+            <!-- Контент загружается динамически -->
+        </div>
+
+        <div class="btn-group">
+            <a href="/" class="btn btn-secondary">← Назад</a>
+        </div>
+    </div>
+
+    <script>
+        let checkInterval;
+        let qrCheckInterval;
+
+        // Проверка начальной авторизации
+        function checkInitialAuth() {
+            fetch('/api/telegram/check_auth')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.authorized) {
+                        showAuthorized(data.user);
+                    } else {
+                        showQRAuth();
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    showQRAuth();
+                });
+        }
+
+        // Показать QR-авторизацию
+        function showQRAuth() {
+            document.getElementById('auth-status').innerHTML = '❌ Не авторизован';
+            document.getElementById('auth-status').className = 'status-value error';
+
+            document.getElementById('content').innerHTML = `
+                <div class="instructions">
+                    <h3>📱 Инструкция по авторизации:</h3>
+                    <ol>
+                        <li>Откройте Telegram на телефоне</li>
+                        <li>Перейдите в <strong>Настройки → Устройства → Подключить устройство</strong></li>
+                        <li>Отсканируйте QR-код ниже</li>
+                        <li>Подтвердите вход</li>
+                    </ol>
+                </div>
+
+                <div class="qr-container">
+                    <div id="qr-code">
+                        <div class="qr-loading">
+                            <div class="spinner"></div>
+                        </div>
+                    </div>
+                    <div class="countdown" id="countdown">
+                        Генерация QR-кода...
+                    </div>
+                </div>
+
+                <div class="btn-group">
+                    <button onclick="generateQR()" class="btn">🔄 Обновить QR-код</button>
+                </div>
+            `;
+
+            // Генерируем QR-код
+            generateQR();
+        }
+
+        // Генерация QR-кода
+        function generateQR() {
+            const qrContainer = document.getElementById('qr-code');
+            qrContainer.innerHTML = `
+                <div class="qr-loading">
+                    <div class="spinner"></div>
+                </div>
+            `;
+
+            fetch('/api/telegram/qr_code')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        if (data.authorized) {
+                            // Уже авторизован
+                            checkInitialAuth();
+                        } else if (data.qr_code) {
+                            // Показываем QR-код
+                            qrContainer.innerHTML = `<img src="${data.qr_code}" alt="QR Code">`;
+
+                            // Запускаем проверку авторизации
+                            startAuthCheck();
+
+                            // Таймер обратного отсчета
+                            startCountdown(120);
+                        }
+                    } else {
+                        qrContainer.innerHTML = `
+                            <div style="text-align: center; padding: 20px; color: #f44336;">
+                                ❌ Ошибка: ${data.error}
+                            </div>
+                        `;
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    qrContainer.innerHTML = `
+                        <div style="text-align: center; padding: 20px; color: #f44336;">
+                            ❌ Ошибка генерации QR-кода
+                        </div>
+                    `;
+                });
+        }
+
+        // Запуск проверки авторизации
+        function startAuthCheck() {
+            // Останавливаем предыдущий интервал если был
+            if (qrCheckInterval) {
+                clearInterval(qrCheckInterval);
+            }
+
+            qrCheckInterval = setInterval(() => {
+                fetch('/api/telegram/check_auth')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.authorized) {
+                            // Успешная авторизация
+                            clearInterval(qrCheckInterval);
+                            showAuthorized(data.user);
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error checking auth:', error);
+                    });
+            }, 2000); // Проверяем каждые 2 секунды
+        }
+
+        // Таймер обратного отсчета
+        function startCountdown(seconds) {
+            const countdownEl = document.getElementById('countdown');
+            let remaining = seconds;
+
+            const interval = setInterval(() => {
+                remaining--;
+                if (remaining > 0) {
+                    countdownEl.textContent = `QR-код действителен еще ${remaining} сек.`;
+                } else {
+                    clearInterval(interval);
+                    countdownEl.textContent = 'QR-код истек. Нажмите "Обновить QR-код"';
+                    clearInterval(qrCheckInterval);
+                }
+            }, 1000);
+        }
+
+        // Показать информацию об авторизованном пользователе
+        function showAuthorized(user) {
+            document.getElementById('auth-status').innerHTML = '✅ Авторизован';
+            document.getElementById('auth-status').className = 'status-value success';
+
+            document.getElementById('content').innerHTML = `
+                <div class="success-message">
+                    ✅ Успешная авторизация!
+                </div>
+
+                <div class="user-info">
+                    <h3>👤 Информация о пользователе</h3>
+                    <div class="user-info-item">
+                        <span class="user-info-label">Имя:</span>
+                        <span class="user-info-value">${user.first_name || 'Не указано'} ${user.last_name || ''}</span>
+                    </div>
+                    <div class="user-info-item">
+                        <span class="user-info-label">Username:</span>
+                        <span class="user-info-value">${user.username ? '@' + user.username : 'Не указан'}</span>
+                    </div>
+                    <div class="user-info-item">
+                        <span class="user-info-label">Телефон:</span>
+                        <span class="user-info-value">${user.phone || 'Не указан'}</span>
+                    </div>
+                    <div class="user-info-item">
+                        <span class="user-info-label">ID:</span>
+                        <span class="user-info-value">${user.id}</span>
+                    </div>
+                    ${user.premium ? `
+                    <div class="user-info-item">
+                        <span class="user-info-label">Premium:</span>
+                        <span class="user-info-value">⭐ Активен</span>
+                    </div>
+                    ` : ''}
+                </div>
+
+                <div class="btn-group">
+                    <button onclick="logout()" class="btn btn-danger">🚪 Выйти</button>
+                </div>
+            `;
+        }
+
+        // Выход из аккаунта
+        function logout() {
+            if (!confirm('Вы уверены, что хотите выйти из аккаунта?')) {
+                return;
+            }
+
+            fetch('/api/telegram/logout', {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showQRAuth();
+                } else {
+                    alert('Ошибка при выходе: ' + data.error);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Ошибка при выходе из аккаунта');
+            });
+        }
+
+        // Инициализация при загрузке страницы
+        document.addEventListener('DOMContentLoaded', () => {
+            checkInitialAuth();
+        });
+
+        // Очистка интервалов при уходе со страницы
+        window.addEventListener('beforeunload', () => {
+            if (checkInterval) clearInterval(checkInterval);
+            if (qrCheckInterval) clearInterval(qrCheckInterval);
+        });
+    </script>
+</body>
+</html>

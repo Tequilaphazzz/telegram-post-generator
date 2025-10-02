@@ -1,675 +1,390 @@
 """
-Главное Flask-приложение для генерации и публикации постов в Telegram
+Flask приложение для генерации и публикации постов в Telegram
+С QR-авторизацией и Stories
 """
-from flask import Flask, render_template, request, jsonify, session
-from flask_cors import CORS
+
 import os
 import json
 import base64
+from io import BytesIO
 from datetime import datetime
-import asyncio
-import threading
-import queue
-from utils.ai_generator import AIGenerator
-from utils.image_processor import ImageProcessor
-from utils.telegram_publisher import TelegramPublisher
-from config import Config
+from flask import Flask, render_template, request, jsonify
+from werkzeug.exceptions import BadRequest
 
-# Глобальное хранилище для publisher'ов
-# Ключ: phone, Значение: publisher instance
-_active_publishers = {}
-_publisher_lock = threading.Lock()
-
-
-def get_publisher(api_id, api_hash, phone):
-    """
-    Получить или создать publisher для данного номера телефона
-    Это гарантирует, что мы используем один и тот же экземпляр
-    """
-    with _publisher_lock:
-        if phone not in _active_publishers:
-            print(f"🆕 Создаем новый publisher для {phone}")
-            _active_publishers[phone] = TelegramPublisher(
-                api_id=str(api_id),
-                api_hash=api_hash,
-                phone=phone
-            )
-        else:
-            print(f"♻️  Используем существующий publisher для {phone}")
-
-        return _active_publishers[phone]
+# Импортируем наши модули
+from telegram_manager import TelegramManager
+from image_generator import ImageGenerator  # Ваш существующий модуль
+from chatgpt_generator import ChatGPTGenerator  # Ваш существующий модуль
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-in-production'
-CORS(app)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
 
-# Глобальные переменные для хранения временных данных
-current_post_data = {}
+# Создаем директории если не существуют
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs('sessions', exist_ok=True)
+
+# Глобальная переменная для Telegram менеджера
+telegram_manager = None
 
 def load_config():
-    """Загрузка конфигурации из файла"""
+    """Загрузка конфигурации"""
     if os.path.exists('config.json'):
-        with open('config.json', 'r', encoding='utf-8') as f:
-            config = json.load(f)
-
-            # Убеждаемся, что telegram_api_id это число
-            if 'telegram_api_id' in config and config['telegram_api_id']:
-                try:
-                    # Если это строка, преобразуем в число
-                    if isinstance(config['telegram_api_id'], str):
-                        config['telegram_api_id'] = int(config['telegram_api_id'])
-                except (ValueError, TypeError):
-                    print(f"⚠️ Не удалось преобразовать telegram_api_id в число: {config['telegram_api_id']}")
-
-            return config
+        with open('config.json', 'r') as f:
+            return json.load(f)
     return {}
 
-def save_config(config_data):
-    """Сохранение конфигурации в файл с правильными типами данных"""
-    # Убеждаемся, что telegram_api_id сохраняется как число
-    if 'telegram_api_id' in config_data and config_data['telegram_api_id']:
-        try:
-            config_data['telegram_api_id'] = int(config_data['telegram_api_id'])
-        except (ValueError, TypeError):
-            pass
+def save_config(config):
+    """Сохранение конфигурации"""
+    with open('config.json', 'w') as f:
+        json.dump(config, f, indent=2)
 
-    with open('config.json', 'w', encoding='utf-8') as f:
-        json.dump(config_data, f, ensure_ascii=False, indent=2)
+def init_telegram_manager():
+    """Инициализация Telegram менеджера"""
+    global telegram_manager
+    config = load_config()
+
+    if config.get('telegram_api_id') and config.get('telegram_api_hash'):
+        telegram_manager = TelegramManager(
+            api_id=int(config['telegram_api_id']),
+            api_hash=config['telegram_api_hash'],
+            phone=config.get('telegram_phone', '')
+        )
+        return True
+    return False
 
 @app.route('/')
 def index():
     """Главная страница"""
-    return render_template('index.html')
+    config = load_config()
+    telegram_status = {
+        'configured': False,
+        'authorized': False,
+        'user': None
+    }
 
-@app.route('/save_config', methods=['POST'])
-def save_configuration():
-    """Сохранение API ключей с правильными типами данных"""
+    # Проверяем конфигурацию и авторизацию
+    if init_telegram_manager():
+        telegram_status['configured'] = True
+        if telegram_manager.is_authorized():
+            telegram_status['authorized'] = True
+            telegram_status['user'] = telegram_manager.get_user_info()
+
+    return render_template('index.html',
+                         config=config,
+                         telegram_status=telegram_status)
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings():
+    """Страница настроек"""
+    if request.method == 'GET':
+        config = load_config()
+        return render_template('settings.html', config=config)
+
+    # Сохранение настроек
     try:
-        data = request.json
+        config = load_config()
 
-        # Получаем telegram_api_id и преобразуем в число
-        telegram_api_id = data.get('telegram_api_id', '')
-
-        # Преобразуем API ID в число для корректной работы с Telegram API
-        if telegram_api_id:
-            try:
-                telegram_api_id = int(str(telegram_api_id).strip())
-            except ValueError:
-                return jsonify({
-                    'status': 'error',
-                    'message': f'Telegram API ID должен быть числом, получено: {telegram_api_id}'
-                }), 400
-        else:
-            telegram_api_id = None  # Если пустая строка, сохраняем как None
-
-        config = {
-            'openai_key': data.get('openai_key', '').strip(),
-            'stability_key': data.get('stability_key', '').strip(),
-            'telegram_api_id': telegram_api_id,  # Сохраняется как число или None
-            'telegram_api_hash': data.get('telegram_api_hash', '').strip(),
-            'telegram_phone': data.get('telegram_phone', '').strip(),
-            'telegram_group': data.get('telegram_group', '').strip()
-        }
-
-        # Валидация данных перед сохранением
-        errors = []
-
-        # Проверка OpenAI key
-        if config['openai_key'] and not config['openai_key'].startswith('sk-'):
-            errors.append('OpenAI ключ обычно начинается с "sk-"')
-
-        # Проверка Telegram API ID
-        if config['telegram_api_id']:
-            if config['telegram_api_id'] < 100000 or config['telegram_api_id'] > 100000000:
-                errors.append('Telegram API ID выглядит некорректным (слишком маленький или большой)')
-
-        # Проверка Telegram API Hash
-        if config['telegram_api_hash']:
-            if len(config['telegram_api_hash']) != 32:
-                errors.append(f'Telegram API Hash должен состоять из 32 символов (получено {len(config["telegram_api_hash"])})')
-
-        # Проверка телефона
-        if config['telegram_phone']:
-            if not config['telegram_phone'].startswith('+'):
-                config['telegram_phone'] = '+' + config['telegram_phone']
-
-        # Если есть предупреждения, но не критичные - сохраняем с предупреждением
-        if errors:
-            save_config(config)
-            return jsonify({
-                'status': 'warning',
-                'message': 'Конфигурация сохранена с предупреждениями',
-                'warnings': errors
-            })
+        # Обновляем конфигурацию
+        config.update({
+            'openai_api_key': request.form.get('openai_api_key', ''),
+            'stability_api_key': request.form.get('stability_api_key', ''),
+            'telegram_api_id': request.form.get('telegram_api_id', ''),
+            'telegram_api_hash': request.form.get('telegram_api_hash', ''),
+            'telegram_phone': request.form.get('telegram_phone', ''),
+            'telegram_group_id': request.form.get('telegram_group_id', '')
+        })
 
         save_config(config)
 
-        # Логирование для отладки
-        print(f"✅ Конфигурация сохранена:")
-        print(f"   API ID: {config['telegram_api_id']} (тип: {type(config['telegram_api_id']).__name__})")
-
-        return jsonify({'status': 'success', 'message': 'Конфигурация сохранена'})
-
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/get_config', methods=['GET'])
-def get_configuration():
-    """Получение сохраненной конфигурации с правильной обработкой типов"""
-    try:
-        config = load_config()
-        # Скрываем часть ключей для безопасности
-        safe_config = {}
-        for key, value in config.items():
-            if value is not None and value != '':
-                # Преобразуем значение в строку для отображения
-                value_str = str(value)
-
-                # Для ключей API скрываем часть символов
-                if key in ['openai_key', 'stability_key', 'telegram_api_hash']:
-                    if len(value_str) > 10:
-                        safe_config[key] = value_str[:5] + '*' * (len(value_str) - 10) + value_str[-5:]
-                    else:
-                        safe_config[key] = value_str
-                else:
-                    # Для остальных полей показываем как есть
-                    safe_config[key] = value_str
-            else:
-                safe_config[key] = ''
-
-        return jsonify({'status': 'success', 'config': safe_config})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-@app.route('/generate_content', methods=['POST'])
-def generate_content():
-    """Генерация контента (текст, изображение, заголовок)"""
-    global current_post_data
-
-    try:
-        data = request.json
-        topic = data.get('topic')
-
-        if not topic:
-            return jsonify({'status': 'error', 'message': 'Тема не указана'}), 400
-
-        config = load_config()
-
-        # Инициализация генератора AI
-        ai_gen = AIGenerator(
-            openai_key=config.get('openai_key'),
-            stability_key=config.get('stability_key')
-        )
-
-        # Генерация текста поста
-        post_text = ai_gen.generate_post_text(topic)
-
-        # Генерация промпта для изображения
-        image_prompt = ai_gen.generate_image_prompt(post_text)
-
-        # Генерация изображения
-        image_data = ai_gen.generate_image(image_prompt)
-
-        # Генерация заголовка для изображения
-        headline = ai_gen.generate_headline(post_text)
-
-        # Обработка изображения
-        processor = ImageProcessor()
-        processed_image = processor.process_image(
-            image_data,
-            headline,
-            aspect_ratio=(9, 16)
-        )
-
-        # Конвертация в base64 для отправки на фронтенд
-        image_base64 = base64.b64encode(processed_image).decode('utf-8')
-
-        # Сохранение данных для последующей публикации
-        current_post_data = {
-            'text': post_text,
-            'image': processed_image,
-            'headline': headline,
-            'original_image': image_data,
-            'topic': topic
-        }
+        # Переинициализируем Telegram менеджер
+        init_telegram_manager()
 
         return jsonify({
-            'status': 'success',
-            'data': {
-                'text': post_text,
-                'image': f'data:image/png;base64,{image_base64}',
-                'headline': headline
-            }
+            'success': True,
+            'message': 'Настройки сохранены'
         })
-
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
 
-@app.route('/regenerate_content', methods=['POST'])
-def regenerate_content():
-    """Регенерация отдельных частей контента"""
-    global current_post_data
+@app.route('/telegram/auth')
+def telegram_auth():
+    """Страница авторизации Telegram"""
+    if not init_telegram_manager():
+        return render_template('error.html',
+                             error='Сначала настройте Telegram API в настройках')
+
+    telegram_status = {
+        'configured': True,
+        'authorized': telegram_manager.is_authorized(),
+        'user': None
+    }
+
+    if telegram_status['authorized']:
+        telegram_status['user'] = telegram_manager.get_user_info()
+
+    return render_template('telegram_auth.html', telegram_status=telegram_status)
+
+@app.route('/api/telegram/qr_code', methods=['GET'])
+def get_qr_code():
+    """Получение QR-кода для авторизации"""
+    if not telegram_manager:
+        return jsonify({
+            'success': False,
+            'error': 'Telegram не настроен'
+        }), 400
 
     try:
-        data = request.json
-        content_type = data.get('type')
+        success, result = telegram_manager.get_qr_code()
 
-        config = load_config()
-        ai_gen = AIGenerator(
-            openai_key=config.get('openai_key'),
-            stability_key=config.get('stability_key')
-        )
-
-        if content_type == 'text':
-            # Регенерация текста
-            new_text = ai_gen.generate_post_text(current_post_data['topic'])
-            current_post_data['text'] = new_text
-            return jsonify({'status': 'success', 'data': {'text': new_text}})
-
-        elif content_type == 'image':
-            # Регенерация изображения
-            image_prompt = ai_gen.generate_image_prompt(current_post_data['text'])
-            image_data = ai_gen.generate_image(image_prompt)
-            current_post_data['original_image'] = image_data
-
-            # Обработка с текущим заголовком
-            processor = ImageProcessor()
-            processed_image = processor.process_image(
-                image_data,
-                current_post_data['headline'],
-                aspect_ratio=(9, 16)
-            )
-            current_post_data['image'] = processed_image
-
-            image_base64 = base64.b64encode(processed_image).decode('utf-8')
-            return jsonify({
-                'status': 'success',
-                'data': {'image': f'data:image/png;base64,{image_base64}'}
-            })
-
-        elif content_type == 'headline':
-            # Регенерация заголовка
-            new_headline = ai_gen.generate_headline(current_post_data['text'])
-            current_post_data['headline'] = new_headline
-
-            # Перерисовка изображения с новым заголовком
-            processor = ImageProcessor()
-            processed_image = processor.process_image(
-                current_post_data['original_image'],
-                new_headline,
-                aspect_ratio=(9, 16)
-            )
-            current_post_data['image'] = processed_image
-
-            image_base64 = base64.b64encode(processed_image).decode('utf-8')
-            return jsonify({
-                'status': 'success',
-                'data': {
-                    'headline': new_headline,
-                    'image': f'data:image/png;base64,{image_base64}'
-                }
-            })
-
-        else:
-            return jsonify({'status': 'error', 'message': 'Неверный тип контента'}), 400
-
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-@app.route('/publish_post', methods=['POST'])
-def publish_post():
-    """Публикация поста в Telegram"""
-    global current_post_data
-
-    try:
-        if not current_post_data:
-            return jsonify({'status': 'error', 'message': 'Нет данных для публикации'}), 400
-
-        data = request.json
-        story_type = data.get('story_type', 'channel')
-
-        config = load_config()
-
-        # Проверяем API ID
-        api_id = config.get('telegram_api_id')
-        if api_id and isinstance(api_id, str):
-            try:
-                api_id = int(api_id)
-            except ValueError:
+        if success:
+            if result == "Уже авторизован":
                 return jsonify({
-                    'status': 'error',
-                    'message': 'Telegram API ID должен быть числом'
-                }), 500
-
-        print(f"📤 Публикация...")
-        print(f"   API ID: {api_id}")
-        print(f"   Группа: {config.get('telegram_group')}")
-        print(f"   Story: {story_type}")
-
-        # ВАЖНО: Используем один event loop
-        result = {'status': 'error', 'message': 'Неизвестная ошибка'}
-        exception = None
-
-        def run_publish():
-            nonlocal result, exception
-            try:
-                # КРИТИЧНО: Создаем НОВЫЙ event loop для этого потока
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-                try:
-                    # Используем общий publisher
-                    publisher = get_publisher(
-                        api_id=api_id,
-                        api_hash=config.get('telegram_api_hash'),
-                        phone=config.get('telegram_phone')
-                    )
-
-                    # Проверяем подключение
-                    connected = loop.run_until_complete(publisher.connect())
-
-                    if not connected:
-                        result = {
-                            'status': 'auth_required',
-                            'message': 'Требуется код подтверждения',
-                            'need_code': True
-                        }
-                        return
-
-                    # Публикуем
-                    publish_result = loop.run_until_complete(
-                        publisher.publish_post(
-                            group_username=config.get('telegram_group'),
-                            text=current_post_data['text'],
-                            image=current_post_data['image'],
-                            publish_to_story=True,
-                            story_type=story_type
-                        )
-                    )
-
-                    result = {'status': 'success', 'data': publish_result}
-
-                finally:
-                    # Закрываем loop
-                    loop.close()
-
-            except Exception as e:
-                exception = e
-                result = {'status': 'error', 'message': str(e)}
-
-        # Запускаем в отдельном потоке
-        thread = threading.Thread(target=run_publish)
-        thread.start()
-        thread.join(timeout=30)
-
-        if exception:
-            error_msg = str(exception)
-            if "требуется верификация" in error_msg.lower() or "код" in error_msg.lower():
-                return jsonify({
-                    'status': 'auth_required',
-                    'message': 'Требуется код подтверждения',
-                    'need_code': True
+                    'success': True,
+                    'authorized': True,
+                    'message': result
                 })
-            else:
-                return jsonify({'status': 'error', 'message': error_msg}), 500
 
-        if result['status'] == 'success':
-            publish_data = result['data']
+            # Генерируем QR-код
+            import qrcode
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(result)
+            qr.make(fit=True)
 
-            success_messages = []
-            warnings = []
+            # Создаем изображение
+            img = qr.make_image(fill_color="black", back_color="white")
 
-            if 'group_post' in publish_data and publish_data['group_post'].get('status') == 'success':
-                success_messages.append(
-                    f'✅ Пост опубликован (ID: {publish_data["group_post"].get("message_id")})'
-                )
-
-            if 'channel_story' in publish_data:
-                if publish_data['channel_story'].get('status') == 'success':
-                    success_messages.append('📸 Story в канал опубликована')
-                else:
-                    warnings.append(f'Story в канал: {publish_data["channel_story"].get("error")}')
-
-            if 'personal_story' in publish_data:
-                if publish_data['personal_story'].get('status') == 'success':
-                    success_messages.append('📸 Личная Story опубликована')
-                else:
-                    warnings.append(f'Личная Story: {publish_data["personal_story"].get("error")}')
+            # Конвертируем в base64
+            buffer = BytesIO()
+            img.save(buffer, format='PNG')
+            buffer.seek(0)
+            qr_base64 = base64.b64encode(buffer.getvalue()).decode()
 
             return jsonify({
-                'status': 'success',
-                'message': 'Публикация завершена!',
-                'details': success_messages,
-                'warnings': warnings
+                'success': True,
+                'qr_code': f'data:image/png;base64,{qr_base64}',
+                'qr_url': result
             })
-
-        elif result['status'] == 'auth_required':
-            return jsonify(result)
-
         else:
-            return jsonify(result), 500
-
-    except Exception as e:
-        print(f"❌ Критическая ошибка: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-@app.route('/verify_telegram_code', methods=['POST'])
-def verify_telegram_code():
-    """Верификация кода Telegram"""
-    try:
-        data = request.json
-        code = data.get('code')
-
-        if not code:
-            return jsonify({'status': 'error', 'message': 'Код не указан'}), 400
-
-        config = load_config()
-
-        api_id = config.get('telegram_api_id')
-        if api_id and isinstance(api_id, str):
-            try:
-                api_id = int(api_id)
-            except ValueError:
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Telegram API ID должен быть числом'
-                }), 500
-
-        phone = config.get('telegram_phone')
-        print(f"🔐 Верификация кода для {phone}: {code}")
-
-        # Результат верификации
-        result = {'status': 'error', 'message': 'Неизвестная ошибка'}
-        exception = None
-
-        def run_verify():
-            nonlocal result, exception
-            try:
-                # КРИТИЧНО: Создаем НОВЫЙ event loop
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-                try:
-                    # Используем тот же publisher
-                    publisher = get_publisher(
-                        api_id=api_id,
-                        api_hash=config.get('telegram_api_hash'),
-                        phone=phone
-                    )
-
-                    # Верифицируем код
-                    verify_result = loop.run_until_complete(
-                        publisher.verify_code(code)
-                    )
-
-                    result = {
-                        'status': 'success',
-                        'message': 'Код подтвержден!',
-                        'retry_publish': True
-                    }
-
-                finally:
-                    loop.close()
-
-            except Exception as e:
-                exception = e
-                result = {'status': 'error', 'message': str(e)}
-
-        # Запускаем в отдельном потоке
-        thread = threading.Thread(target=run_verify)
-        thread.start()
-        thread.join(timeout=15)
-
-        if exception:
-            error_msg = str(exception)
-            print(f"❌ Ошибка верификации: {error_msg}")
-
-            if "password" in error_msg.lower() or "2fa" in error_msg.lower():
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Требуется пароль 2FA',
-                    'need_2fa': True
-                }), 400
-            elif "неверный код" in error_msg.lower() or "invalid" in error_msg.lower():
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Неверный код. Проверьте и попробуйте снова.',
-                    'need_retry': True
-                }), 400
-            elif "истек" in error_msg.lower() or "expired" in error_msg.lower():
-                return jsonify({
-                    'status': 'error',
-                    'message': 'Код истек. Новый код отправлен в Telegram.',
-                    'need_restart': True
-                }), 400
-            else:
-                return jsonify({
-                    'status': 'error',
-                    'message': error_msg
-                }), 400
-
-        if result['status'] == 'success':
-            return jsonify(result)
-        else:
-            return jsonify(result), 400
-
-    except Exception as e:
-        print(f"❌ Критическая ошибка верификации: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
-# ============================================
-# ДОБАВЬТЕ ENDPOINT ДЛЯ ОЧИСТКИ СЕССИЙ (опционально)
-# ============================================
-
-@app.route('/clear_sessions', methods=['POST'])
-def clear_sessions():
-    """Очистка всех активных сессий и publisher'ов"""
-    try:
-        global _active_publishers
-
-        with _publisher_lock:
-            # Закрываем все активные клиенты
-            for phone, publisher in _active_publishers.items():
-                try:
-                    if publisher.client and publisher.client.is_connected():
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        loop.run_until_complete(publisher.client.disconnect())
-                        print(f"🔌 Отключен publisher для {phone}")
-                except:
-                    pass
-
-            _active_publishers.clear()
-
-        # Удаляем файл сессий
-        if os.path.exists('telegram_sessions.json'):
-            os.remove('telegram_sessions.json')
-            print("🗑️  Файл сессий удален")
-
-        return jsonify({
-            'status': 'success',
-            'message': 'Все сессии очищены. Требуется повторная авторизация.'
-        })
+            return jsonify({
+                'success': False,
+                'error': result
+            }), 400
 
     except Exception as e:
         return jsonify({
-            'status': 'error',
-            'message': str(e)
+            'success': False,
+            'error': str(e)
         }), 500
 
+@app.route('/api/telegram/check_auth', methods=['GET'])
+def check_telegram_auth():
+    """Проверка статуса авторизации"""
+    if not telegram_manager:
+        return jsonify({
+            'success': False,
+            'error': 'Telegram не настроен'
+        }), 400
 
-@app.route('/check_story_support', methods=['POST'])
-def check_story_support():
-    """Проверка поддержки Stories для группы/канала"""
     try:
-        data = request.json
-        group_username = data.get('group_username', '')
+        result = telegram_manager.check_qr_auth()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
-        if not group_username:
-            config = load_config()
-            group_username = config.get('telegram_group', '')
+@app.route('/api/telegram/logout', methods=['POST'])
+def telegram_logout():
+    """Выход из Telegram"""
+    if not telegram_manager:
+        return jsonify({
+            'success': False,
+            'error': 'Telegram не настроен'
+        }), 400
 
-        if not group_username:
+    try:
+        success = telegram_manager.logout()
+        return jsonify({
+            'success': success,
+            'message': 'Успешно вышли из аккаунта' if success else 'Ошибка при выходе'
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/generate_post', methods=['POST'])
+def generate_post():
+    """Генерация поста"""
+    try:
+        data = request.get_json()
+        topic = data.get('topic', '')
+
+        if not topic:
             return jsonify({
-                'status': 'error',
-                'message': 'Группа/канал не указаны'
+                'success': False,
+                'error': 'Не указана тема'
             }), 400
 
         config = load_config()
 
-        # Проверяем поддержку Stories
-        def run_async_check():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        # Генерируем текст через ChatGPT
+        if not config.get('openai_api_key'):
+            return jsonify({
+                'success': False,
+                'error': 'Не настроен OpenAI API'
+            }), 400
 
-            publisher = TelegramPublisher(
-                api_id=str(config.get('telegram_api_id')),
-                api_hash=config.get('telegram_api_hash'),
-                phone=config.get('telegram_phone')
+        gpt = ChatGPTGenerator(config['openai_api_key'])
+        post_data = gpt.generate_post(topic)
+
+        if not post_data['success']:
+            return jsonify(post_data), 400
+
+        # Генерируем изображение через Stability AI
+        if config.get('stability_api_key'):
+            img_gen = ImageGenerator(config['stability_api_key'])
+            image_result = img_gen.generate_story_image(
+                prompt=post_data['image_prompt'],
+                title=post_data['title']
             )
 
-            result = loop.run_until_complete(
-                publisher.check_story_support(group_username)
-            )
-            return result
+            if image_result['success']:
+                post_data['image'] = image_result['image']
 
-        thread = threading.Thread(target=run_async_check)
-        thread.start()
-        thread.join(timeout=10)
-
-        # Возвращаем базовую информацию
-        return jsonify({
-            'status': 'success',
-            'message': 'Проверка выполнена',
-            'info': {
-                'supports_stories': True,  # Оптимистично предполагаем поддержку
-                'alternative_method': True,
-                'note': 'Stories будут опубликованы доступным методом'
-            }
-        })
+        return jsonify(post_data)
 
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/publish_post', methods=['POST'])
+def publish_post():
+    """Публикация поста в Telegram"""
+    try:
+        data = request.get_json()
+
+        if not telegram_manager:
+            return jsonify({
+                'success': False,
+                'error': 'Telegram не настроен'
+            }), 400
+
+        if not telegram_manager.is_authorized():
+            return jsonify({
+                'success': False,
+                'error': 'Не авторизован в Telegram'
+            }), 401
+
+        config = load_config()
+        group_id = config.get('telegram_group_id')
+
+        if not group_id:
+            return jsonify({
+                'success': False,
+                'error': 'Не указан ID группы'
+            }), 400
+
+        # Декодируем изображение если есть
+        image_bytes = None
+        if data.get('image'):
+            image_data = data['image'].split(',')[1] if ',' in data['image'] else data['image']
+            image_bytes = base64.b64decode(image_data)
+
+        # Публикуем в группу
+        result = telegram_manager.publish_to_group(
+            group_id=group_id,
+            text=data['content'],
+            image_bytes=image_bytes
+        )
+
+        if not result['success']:
+            return jsonify(result), 400
+
+        # Если есть изображение, публикуем и в Stories
+        if image_bytes and data.get('publish_story', True):
+            story_result = telegram_manager.publish_personal_story(
+                image_bytes=image_bytes,
+                caption=data.get('title', '')
+            )
+
+            result['story'] = story_result
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/publish_story', methods=['POST'])
+def publish_story():
+    """Публикация только в Stories"""
+    try:
+        data = request.get_json()
+
+        if not telegram_manager:
+            return jsonify({
+                'success': False,
+                'error': 'Telegram не настроен'
+            }), 400
+
+        if not telegram_manager.is_authorized():
+            return jsonify({
+                'success': False,
+                'error': 'Не авторизован в Telegram'
+            }), 401
+
+        # Декодируем изображение
+        if not data.get('image'):
+            return jsonify({
+                'success': False,
+                'error': 'Изображение обязательно для Stories'
+            }), 400
+
+        image_data = data['image'].split(',')[1] if ',' in data['image'] else data['image']
+        image_bytes = base64.b64decode(image_data)
+
+        # Публикуем Story
+        result = telegram_manager.publish_personal_story(
+            image_bytes=image_bytes,
+            caption=data.get('caption', '')
+        )
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.errorhandler(404)
+def not_found(e):
+    return render_template('error.html', error='Страница не найдена'), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    return render_template('error.html', error='Внутренняя ошибка сервера'), 500
 
 if __name__ == '__main__':
-    os.makedirs('templates', exist_ok=True)
-    os.makedirs('static', exist_ok=True)
-    os.makedirs('utils', exist_ok=True)
+    # Инициализируем при запуске
+    init_telegram_manager()
 
-    # Проверяем и исправляем config.json при запуске
-    config = load_config()
-    if config:
-        print("🔍 Проверка конфигурации...")
-        if 'telegram_api_id' in config:
-            if isinstance(config['telegram_api_id'], str):
-                print(f"⚠️ telegram_api_id сохранён как строка: '{config['telegram_api_id']}'")
-                print("🔧 Исправляем...")
-                save_config(config)
-                print("✅ Конфигурация исправлена")
-            else:
-                print(f"✅ telegram_api_id корректно сохранён как число: {config['telegram_api_id']}")
-
-    app.run(debug=True, port=5000)
+    # Запускаем сервер
+    app.run(debug=True, host='0.0.0.0', port=5000)
